@@ -53,9 +53,7 @@ def _requerida(nombre: str) -> str:
 
 
 
-CHAT_ID = int(_requerida(" 6135930296"))
-DERIV_TOKEN = _requerida("4SrOKKh5Ggm9AAd")
-DERIV_APP_ID = os.environ.get("18206760", "1089").strip()
+
 SYMBOL = os.environ.get("DERIV_SYMBOL", "R_100").strip()
 MODO_REAL = os.environ.get("MODO_REAL", "false").strip().lower() == "true"
 MULTIPLICADORES = sorted({int(x) for x in os.environ.get(
