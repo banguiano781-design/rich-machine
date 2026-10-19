@@ -66,9 +66,9 @@ TICKS = 5000
 INTERVALO_KEEPALIVE = 600 
 INTERVALO_AUTO = 20       
 
-# Corrección definitiva de la variable de la APP ID
+# Corrección de la variable de la APP ID
 DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089").strip()
-DERIV_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+DERIV_URL = f"wss://://derivws.com{DERIV_APP_ID}"
 
 # ═════════════════════════════════════════════════════════════════
 #  1. KEEP-ALIVE: servidor Flask en hilo secundario + autoping
@@ -232,8 +232,9 @@ async def leer_mercado() -> Lectura | None:
     velas = pd.DataFrame(velas_r["candles"])
     if len(velas) < EMA_MACRO + 5:
         return None
+    
     for col in ("open", "high", "low", "close"):
-        velas[col] = candles = velas[col].astype(float)
+        velas[col] = velas[col].astype(float)
 
     precios = [float(p) for p in ticks_r["history"]["prices"]]
     tiempos = [int(t) for t in ticks_r["history"]["times"]]
@@ -364,7 +365,7 @@ saldo = (await DERIV.request({"balance": 1}))["balance"]
 return f"💰 Ganancias (cuenta Deriv)\nHoy: ${g_hoy:+.2f} en {n_hoy} operaciones\nÚltimas {n_tot} operaciones: ${g_tot:+.2f}\nSaldo actual: ${float(saldo['balance']):.2f} {saldo.get('moneda', 'USD')}"
 
 # ═══════════════════════════════════════════════════════════════
-# 6. MODO AUTOMÁTICO
+#  6. MODO AUTOMÁTICO
 # ═══════════════════════════════════════════════════════════════
 
 async def ciclo_automatico(bot) -> Ninguno: 
@@ -506,7 +507,7 @@ await editar(q, texto_menu(), teclado_menu())
 elif dato == "manual": 
 await mostrar_menu_manual(q) 
 elif dato.startswith("ejecutar:"): 
-await ejecutar_manual(q, int(dato.split(":")[1]), context.bot) 
+await ejecutar_manual(q, int(dato.split(":")), context.bot) 
 elif dato == "auto:on": 
 ESTADO.auto_activo = True 
 await editar(q, texto_menu(), teclado_menu()) 
