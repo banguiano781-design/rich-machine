@@ -1,4 +1,4 @@
-"""
+ """
 bot_hibrido.py: bot híbrido (Modo Manual + Modo Automático) para Deriv,
 controlado desde Telegram y desplegado como Web Service gratuito en Render.
 
