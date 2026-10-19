@@ -288,13 +288,9 @@ tendencia = "alcista" if plan.direccion > 0 else "bajista"
 operacion = "compra" if plan.direccion > 0 else "venta" 
 return f"la tendencia es '{tendencia}' cuanto quieres ganar {fmt(plan.tp)} y cuanto es el stop lose {fmt(plan.sl)}; entré en {operacion}"
 
-═══════════════════════════════════════════════════════════════
-
-
-5. EJECUCIÓN Y SEGUIMIENTO
-
-
-═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  5. EJECUCIÓN Y SEGUIMIENTO
+# ═══════════════════════════════════════════════════════════════
 
 class Estado: 
 def init (self) -> None: 
@@ -367,13 +363,9 @@ n_tot, g_tot = await resumen_resultados(None)
 saldo = (await DERIV.request({"balance": 1}))["balance"] 
 return f"💰 Ganancias (cuenta Deriv)\nHoy: ${g_hoy:+.2f} en {n_hoy} operaciones\nÚltimas {n_tot} operaciones: ${g_tot:+.2f}\nSaldo actual: ${float(saldo['balance']):.2f} {saldo.get('moneda', 'USD')}"
 
-═══════════════════════════════════════════════════════════════
-
-
-6. MODO AUTOMÁTICO
-
-
-═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# 6. MODO AUTOMÁTICO
+# ═══════════════════════════════════════════════════════════════
 
 async def ciclo_automatico(bot) -> Ninguno: 
 lectura = await leer_mercado() 
@@ -405,13 +397,9 @@ excepto Excepción:
 log.exception("Error en el ciclo automático") 
 await asyncio.sleep(INTERVALO_AUTO)
 
-═══════════════════════════════════════════════════════════════
-
-
-7. TELEGRAM: menú, modo manual y comandos
-
-
-═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  7. TELEGRAM: menú, modo manual y comandos
+# ═══════════════════════════════════════════════════════════════
 
 def solo_dueno(func): 
 @functools.wraps(func) 
@@ -531,13 +519,9 @@ excepto Excepción como e:
 log.exception("Error en el botón %s", dato) 
 await editar(q, f"Error: {e}", boton_volver())
 
-═══════════════════════════════════════════════════════════════
-
-
-8. ARRANQUE Y APAGADO
-
-
-═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  8. ARRANQUE Y APAGADO
+# ═══════════════════════════════════════════════════════════════
 
 async def on_init(app: Application) -> None: 
 global DERIV 
