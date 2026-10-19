@@ -52,7 +52,7 @@ def _requerida(nombre: str) -> str:
     return valor
 
 
-TELEGRAM_TOKEN = _requerida("7987036684:AAHI8Jc4ovto76RE-ar68nNJNL1qeYJE6sQ")
+
 CHAT_ID = int(_requerida(" 6135930296"))
 DERIV_TOKEN = _requerida("4SrOKKh5Ggm9AAd")
 DERIV_APP_ID = os.environ.get("18206760", "1089").strip()
