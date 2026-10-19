@@ -271,7 +271,6 @@ def planificar(direccion: int, entrada: float, atr: float) -> tuple[Plan | None,
     cota = RIESGO_MAX_USD * entrada / (STAKE * dist_min)
     candidatos = [m for m in MULTIPLICADORES if m <= cota]
     if not candidatos:
-Utilice el código con precaución.
 return Ninguno, f"con ${RIESGO_MAX_USD:.2f} de riesgo el SL quedaría dentro del ruido (menos de {SL_ATR_MULT} ATR)" 
 m = max(candidatos) 
 dist_sl = RIESGO_MAX_USD * entrada / (STAKE * m) 
