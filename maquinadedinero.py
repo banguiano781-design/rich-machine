@@ -1,19 +1,6 @@
- """
+"""
 bot_hibrido.py: bot híbrido (Modo Manual + Modo Automático) para Deriv,
 controlado desde Telegram y desplegado como Web Service gratuito en Render.
-
-Variables de entorno obligatorias:
-  TELEGRAM_TOKEN    token del bot (BotFather)
-  TELEGRAM_CHAT_ID  tu chat ID; solo ese chat puede dar órdenes
-  DERIV_TOKEN       token de API de Deriv (cuenta demo o real)
-
-Opcionales:
-  DERIV_APP_ID      app_id de Deriv (por defecto 1089, el de pruebas; registra el tuyo)
-  DERIV_SYMBOL      símbolo (por defecto R_100)
-  MODO_REAL         "true" solo con token de cuenta REAL (por defecto false = demo)
-  MULTIPLICADORES   multiplicadores permitidos, separados por coma (verifícalos en Deriv)
-  RENDER_EXTERNAL_URL  URL pública del servicio (Render la define sola)
-  PORT              puerto HTTP (Render lo asigna)
 """
 from __future__ import annotations
 
@@ -41,33 +28,28 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bot_hibrido")
 
-
 # ═════════════════════════════════════════════════════════════════
 #  CONFIGURACIÓN
 # ═════════════════════════════════════════════════════════════════
-def _requerida(nombre: str) -> str:
-    valor = os.environ.get(nombre, "").strip()
-    if not valor:
-        raise SystemExit(f"Falta la variable de entorno {nombre}")
-    return valor
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0").strip()) if os.environ.get("TELEGRAM_CHAT_ID", "").strip() else 0
+DERIV_TOKEN = os.environ.get("DERIV_TOKEN", "").strip()
 
-
-
+if not TELEGRAM_TOKEN or not CHAT_ID or not DERIV_TOKEN:
+    raise SystemExit("Falta alguna de las variables de entorno principales en Render.")
 
 SYMBOL = os.environ.get("DERIV_SYMBOL", "R_100").strip()
 MODO_REAL = os.environ.get("MODO_REAL", "false").strip().lower() == "true"
-MULTIPLICADORES = sorted({int(x) for x in os.environ.get(
-    "MULTIPLICADORES", "10,20,30,40,50,100,200").split(",") if x.strip()})
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL",
-                            "https://rich-machine.onrender.com")
+MULTIPLICADORES = sorted({int(x) for x in os.environ.get("MULTIPLICADORES", "10,20,30,40,50,100,200").split(",") if x.strip()})
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://onrender.com")
 PORT = int(os.environ.get("PORT", "5000"))
 
 # Gestión de riesgo (fija, en dólares)
-STAKE = 0.50              # cantidad que se arriesga en la operación
-RIESGO_MAX_USD = 0.05     # pérdida máxima por operación
-BENEFICIO_MIN_USD = 0.15  # beneficio objetivo por operación
-RATIO_RR = 3.0            # beneficio / riesgo (1:3)
-SL_ATR_MULT = 1.5         # el SL nunca queda más cerca que 1.5 ATR
+STAKE = 0.50              
+RIESGO_MAX_USD = 0.05     
+BENEFICIO_MIN_USD = 0.15  
+RATIO_RR = 3.0            
+SL_ATR_MULT = 1.5         
 
 # Señal
 ZLEN = 20
@@ -75,40 +57,36 @@ ATR_LEN = 14
 EMA_MACRO = 200
 VOL_LEN = 20
 VOL_MULT = 2.5
-Z_UMBRAL = 2.0            # supuesto: |Z| mínimo para dar dirección en automático
+Z_UMBRAL = 2.0            
 
 # Datos y temporizadores
-GRANULARIDAD = 60         # velas de 1 minuto
+GRANULARIDAD = 60         
 VELAS = 300
-TICKS = 5000              # máximo que admite ticks_history
-INTERVALO_KEEPALIVE = 600 # 10 minutos
-INTERVALO_AUTO = 20       # segundos entre revisiones del modo automático
+TICKS = 5000              
+INTERVALO_KEEPALIVE = 600 
+INTERVALO_AUTO = 20       
 
+# Corrección definitiva de la variable de la APP ID
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089").strip()
 DERIV_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
-
 
 # ═════════════════════════════════════════════════════════════════
 #  1. KEEP-ALIVE: servidor Flask en hilo secundario + autoping
 # ═════════════════════════════════════════════════════════════════
 flask_app = Flask(__name__)
 
-
 @flask_app.route("/")
 def inicio():
     return "Bot híbrido activo", 200
 
-
 def _servir_web() -> None:
     flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
-
 
 def iniciar_servidor_web() -> None:
     hilo = threading.Thread(target=_servir_web, name="flask-keepalive", daemon=True)
     hilo.start()
 
-
 async def keep_alive(url: str) -> None:
-    """Pide la URL pública cada 10 minutos para que Render no suspenda el servicio."""
     while True:
         await asyncio.sleep(INTERVALO_KEEPALIVE)
         try:
@@ -117,13 +95,11 @@ async def keep_alive(url: str) -> None:
         except Exception as e:
             log.warning("Keep-alive falló: %s", e)
 
-
 # ═════════════════════════════════════════════════════════════════
 #  2. CLIENTE DERIV (WebSocket con reconexión automática)
 # ═════════════════════════════════════════════════════════════════
 class DerivError(Exception):
     pass
-
 
 class DerivClient:
     def __init__(self, token: str, url: str) -> None:
@@ -165,8 +141,7 @@ class DerivClient:
         espera = 2
         while True:
             try:
-                async with websockets.connect(self.url, ping_interval=20,
-                                              ping_timeout=20) as ws:
+                async with websockets.connect(self.url, ping_interval=20, ping_timeout=20) as ws:
                     self.ws = ws
                     await ws.send(json.dumps({"authorize": self.token}))
                     resp = json.loads(await ws.recv())
@@ -193,29 +168,23 @@ class DerivClient:
             await asyncio.sleep(espera)
             espera = min(espera * 2, 60)
 
-
 DERIV: DerivClient | None = None
-
 
 # ═════════════════════════════════════════════════════════════════
 #  3. DATOS E INDICADORES
-#  Deriv no entrega volumen. El "volumen" es un proxy: suma del
-#  movimiento absoluto de los ticks dentro de cada minuto.
 # ═════════════════════════════════════════════════════════════════
 PIP: float | None = None
 DECIMALES = 5
 
-
 @dataclass
 class Lectura:
-    epoch: int            # inicio de la última vela cerrada
-    cierre: float         # cierre de la última vela cerrada
-    precio_vivo: float    # último tick
+    epoch: int            
+    cierre: float         
+    precio_vivo: float    
     z: float
     atr: float
     ema_macro: float
     vol_inst: bool
-
 
 def proxy_volumen(precios: list, tiempos: list) -> pd.Series:
     p = pd.Series(precios, dtype="float64")
@@ -223,7 +192,6 @@ def proxy_volumen(precios: list, tiempos: list) -> pd.Series:
     movimiento = p.diff().abs().fillna(0.0)
     bucket = (t // GRANULARIDAD) * GRANULARIDAD
     return movimiento.groupby(bucket.to_numpy()).sum()
-
 
 def calcular_indicadores(velas: pd.DataFrame) -> pd.DataFrame:
     df = velas.copy()
@@ -241,7 +209,6 @@ def calcular_indicadores(velas: pd.DataFrame) -> pd.DataFrame:
     df["vol_inst"] = df["vol_proxy"] > df["vol_media"] * VOL_MULT
     return df
 
-
 async def obtener_pip() -> tuple[float, int]:
     r = await DERIV.request({"active_symbols": "brief"})
     for s in r.get("active_symbols", []):
@@ -250,11 +217,8 @@ async def obtener_pip() -> tuple[float, int]:
             return pip, max(0, int(round(-math.log10(pip))))
     return 0.00001, 5
 
-
 def redondear(precio: float) -> float:
-    """Equivalente a math.round_to_mintick: redondea al pip del símbolo."""
     return round(round(precio / PIP) * PIP, DECIMALES)
-
 
 async def leer_mercado() -> Lectura | None:
     global PIP, DECIMALES
@@ -262,55 +226,42 @@ async def leer_mercado() -> Lectura | None:
         PIP, DECIMALES = await obtener_pip()
 
     velas_r, ticks_r = await asyncio.gather(
-        DERIV.request({"ticks_history": SYMBOL, "style": "candles",
-                       "granularity": GRANULARIDAD, "count": VELAS, "end": "latest"}),
-        DERIV.request({"ticks_history": SYMBOL, "style": "ticks",
-                       "count": TICKS, "end": "latest"}),
+        DERIV.request({"ticks_history": SYMBOL, "style": "candles", "granularity": GRANULARIDAD, "count": VELAS, "end": "latest"}),
+        DERIV.request({"ticks_history": SYMBOL, "style": "ticks", "count": TICKS, "end": "latest"}),
     )
     velas = pd.DataFrame(velas_r["candles"])
     if len(velas) < EMA_MACRO + 5:
         return None
     for col in ("open", "high", "low", "close"):
-        velas[col] = velas[col].astype(float)
+        velas[col] = candles = velas[col].astype(float)
 
     precios = [float(p) for p in ticks_r["history"]["prices"]]
     tiempos = [int(t) for t in ticks_r["history"]["times"]]
     proxy = proxy_volumen(precios, tiempos)
     velas["vol_proxy"] = velas["epoch"].map(proxy).fillna(0.0).astype(float)
 
-    # Las 20 velas previas a la cerrada deben tener datos de ticks; si no, no hay señal.
     ventana = velas["epoch"].iloc[-(VOL_LEN + 1):-1]
     if not ventana.isin(proxy.index).all():
         return None
 
-    # Deriv incluye la vela en formación como última; usamos la penúltima (cerrada).
     ind = calcular_indicadores(velas)
     c = ind.iloc[-2]
     if pd.isna(c["z"]) or pd.isna(c["atr"]):
         return None
-    return Lectura(epoch=int(c["epoch"]), cierre=float(c["close"]),
-                   precio_vivo=precios[-1], z=float(c["z"]),
-                   atr=float(c["atr"]), ema_macro=float(c["ema_macro"]),
-                   vol_inst=bool(c["vol_inst"]))
-
+    return Lectura(epoch=int(c["epoch"]), cierre=float(c["close"]), precio_vivo=precios[-1], z=float(c["z"]), atr=float(c["atr"]), ema_macro=float(c["ema_macro"]), vol_inst=bool(c["vol_inst"]))
 
 # ═════════════════════════════════════════════════════════════════
 #  4. PLAN DE OPERACIÓN CON FILTRO DE RIESGO
-#  El SL en dólares se fija en $0.05 y el TP en $0.15 (ratio 1:3).
-#  El multiplicador es la palanca que adapta la distancia al ATR:
-#  el mayor permitido que deja el SL al menos 1.5 ATR de la entrada.
-#  Sobre el precio:  pérdida = distancia × STAKE × m / entrada
 # ═════════════════════════════════════════════════════════════════
 @dataclass
 class Plan:
-    direccion: int        # 1 = compra, -1 = venta
+    direccion: int        
     multiplicador: int
     entrada: float
     sl: float
     tp: float
     riesgo_usd: float
     beneficio_usd: float
-
 
 def planificar(direccion: int, entrada: float, atr: float) -> tuple[Plan | None, str]:
     if not atr or atr <= 0:
@@ -319,362 +270,298 @@ def planificar(direccion: int, entrada: float, atr: float) -> tuple[Plan | None,
     cota = RIESGO_MAX_USD * entrada / (STAKE * dist_min)
     candidatos = [m for m in MULTIPLICADORES if m <= cota]
     if not candidatos:
-        return None, (f"con ${RIESGO_MAX_USD:.2f} de riesgo el SL quedaría dentro "
-                      f"del ruido (menos de {SL_ATR_MULT} ATR)")
-    m = max(candidatos)
-    dist_sl = RIESGO_MAX_USD * entrada / (STAKE * m)
-    dist_tp = RATIO_RR * dist_sl
-    riesgo = dist_sl * STAKE * m / entrada
-    beneficio = dist_tp * STAKE * m / entrada
-    if riesgo > RIESGO_MAX_USD + 1e-9 or beneficio < BENEFICIO_MIN_USD - 1e-9:
-        return None, "no cumple el filtro de riesgo y beneficio"
-    plan = Plan(
-        direccion=direccion,
-        multiplicador=m,
-        entrada=entrada,
-        sl=redondear(entrada - direccion * dist_sl),
-        tp=redondear(entrada + direccion * dist_tp),
-        riesgo_usd=riesgo,
-        beneficio_usd=beneficio,
-    )
-    return plan, ""
+Utilice el código con precaución.
+return Ninguno, f"con ${RIESGO_MAX_USD:.2f} de riesgo el SL quedaría dentro del ruido (menos de {SL_ATR_MULT} ATR)" 
+m = max(candidatos) 
+dist_sl = RIESGO_MAX_USD * entrada / (STAKE * m) 
+dist_tp = RATIO_RR * dist_sl 
+riesgo = dist_sl * STAKE * m / entrada 
+beneficio = dist_tp * STAKE * m / entrada 
+if riesgo > RIESGO_MAX_USD + 1e-9 or beneficio < BENEFICIO_MIN_USD - 1e-9: 
+return Ninguno, "no cumple el filtro de riesgo y beneficio" 
+plan = Plan(direccion=direccion, multiplicador=m, entrada=entrada, sl=redondear(entrada - direccion * dist_sl), tp=redondear(entrada + direccion * dist_tp), riesgo_usd=riesgo, beneficio_usd=beneficio) 
+plan de retorno, ""
+def fmt(precio: float) -> str: 
+return f"{precio:.7f}".rstrip("0").rstrip(".")
+def texto_alerta(plan: Plan) -> str: 
+tendencia = "alcista" if plan.direccion > 0 else "bajista" 
+operacion = "compra" if plan.direccion > 0 else "venta" 
+return f"la tendencia es '{tendencia}' cuanto quieres ganar {fmt(plan.tp)} y cuanto es el stop lose {fmt(plan.sl)}; entré en {operacion}"
+
+═══════════════════════════════════════════════════════════════
 
 
-def fmt(precio: float) -> str:
-    """Equivalente a str.tostring(precio, "#.#######")."""
-    return f"{precio:.7f}".rstrip("0").rstrip(".")
+5. EJECUCIÓN Y SEGUIMIENTO
 
 
-def texto_alerta(plan: Plan) -> str:
-    tendencia = "alcista" if plan.direccion > 0 else "bajista"
-    operacion = "compra" if plan.direccion > 0 else "venta"
-    return (f"la tendencia es '{tendencia}' cuanto quieres ganar {fmt(plan.tp)} "
-            f"y cuanto es el stop lose {fmt(plan.sl)}; entré en {operacion}")
+═══════════════════════════════════════════════════════════════
 
-
-# ═════════════════════════════════════════════════════════════════
-#  5. EJECUCIÓN Y SEGUIMIENTO
-# ═════════════════════════════════════════════════════════════════
-class Estado:
-    def __init__(self) -> None:
-        self.auto_activo = False
-        self.ultima_vela: int | None = None
-        self.lock: asyncio.Lock | None = None
-        self.tareas: list[asyncio.Task] = []
-        self.vigilancias: set[asyncio.Task] = set()
-
-
+class Estado: 
+def init (self) -> None: 
+self.auto_activo = False 
+self.ultima_vela: int | None = None 
+self.lock: asyncio.Lock | None = None 
+self.tareas: list[asyncio.Task] = [] 
+self.vigilancias: set[asyncio.Task] = set()
 ESTADO = Estado()
+def verificar_modo() -> Ninguno: 
+es_demo = bool(DERIV.info.get("is_virtual")) 
+if (not es_demo) != MODO_REAL: 
+rise RuntimeError("El token no coincide con MODO_REAL. Con MODO_REAL=false solo se opera en demo.")
+async def abrir_operacion(plan: Plan, bot) -> str: 
+async with ESTADO.lock: 
+verificar_modo() 
+abiertas = await DERIV.request({"portfolio": 1}) 
+if abiertas["portfolio"].get("contracts"): 
+rise RuntimeError("ya hay una operación abierta; espero a que cierre")
+tipo = "MULTUP" if plan.direccion > 0 else "MULTDOWN" 
+prop = (await DERIV.request({ 
+"proposal": 1, 
+"amount": STAKE, 
+"basis": "stake", 
+"contract_type": tipo, 
+"currency": "USD", 
+"symbol": SYMBOL, 
+"multiplier": plan.multiplicador, 
+"limit_order": { 
+"stop_loss": round(RIESGO_MAX_USD, 2), 
+"take_profit": round(BENEFICIO_MIN_USD, 2), 
+}, 
+}))["proposal"] 
+compra = (await DERIV.request({"buy": prop["id"], "price": prop["ask_price"]}))["buy"] 
+contrato = str(compra["contract_id"])
+await bot.send_message(chat_id=CHAT_ID, text=texto_alerta(plan)) 
+tarea = asyncio.create_task(vigilar_contrato(contrato, bot)) 
+ESTADO.vigilancias.add(tarea) 
+tarea.add_done_callback(ESTADO.vigilancias.discard) 
+return contrato
+async def vigilar_contrato(contrato: str, bot) -> Ninguno: 
+while True: 
+await asyncio.sleep(5) 
+try: 
+r = await DERIV.request({"proposal_open_contract": 1, "contract_id": contrato}) 
+excepto Excepción como e: 
+log.warning("No pude consultar el contrato %s: %s", contrato, e) 
+continue 
+c = r["proposal_open_contract"] 
+if c.get("is_sold"): 
+resultado = float(c.get("profit", 0.0)) 
+try: 
+await bot.send_message(chat_id=CHAT_ID, text=f"🏁 Contrato {contrato} cerrado. Resultado: ${resultado:+.2f}") 
+excepto excepción como e: 
+log.warning("No pude notificar el cierre: %s", e) 
+return
+async def resumen_resultados(desde: int | None) -> tuple[int, float]: 
+payload = {"profit_table": 1, "description": 1, "sort": "DESC", "limit": 100} 
+if desde is not None: 
+payload["date_from"] = desde 
+r = await DERIV.request(payload) 
+txs = r["profit_table"].get("transactions", []) 
+ganancia = sum(float(t.get("sell_price", 0)) - float(t.get("buy_price", 0)) for t in txs) 
+return len(txs),ganancia
+async def texto_ganancias() -> str: 
+ahora = datetime.now(timezone.utc) 
+inicio_dia = int(ahora.replace(hora=0, minuto=0, segundo=0, microsegundo=0).timestamp()) 
+n_hoy, g_hoy = await resumen_resultados(inicio_dia) 
+n_tot, g_tot = await resumen_resultados(None) 
+saldo = (await DERIV.request({"balance": 1}))["balance"] 
+return f"💰 Ganancias (cuenta Deriv)\nHoy: ${g_hoy:+.2f} en {n_hoy} operaciones\nÚltimas {n_tot} operaciones: ${g_tot:+.2f}\nSaldo actual: ${float(saldo['balance']):.2f} {saldo.get('moneda', 'USD')}"
+
+═══════════════════════════════════════════════════════════════
 
 
-def verificar_modo() -> None:
-    es_demo = bool(DERIV.info.get("is_virtual"))
-    if (not es_demo) != MODO_REAL:
-        raise RuntimeError(
-            "El token no coincide con MODO_REAL. Con MODO_REAL=false solo se opera en demo.")
+6. MODO AUTOMÁTICO
 
 
-async def abrir_operacion(plan: Plan, bot) -> str:
-    async with ESTADO.lock:
-        verificar_modo()
-        abiertas = await DERIV.request({"portfolio": 1})
-        if abiertas["portfolio"].get("contracts"):
-            raise RuntimeError("ya hay una operación abierta; espero a que cierre")
+═══════════════════════════════════════════════════════════════
 
-        tipo = "MULTUP" if plan.direccion > 0 else "MULTDOWN"
-        prop = (await DERIV.request({
-            "proposal": 1,
-            "amount": STAKE,
-            "basis": "stake",
-            "contract_type": tipo,
-            "currency": "USD",
-            "symbol": SYMBOL,
-            "multiplier": plan.multiplicador,
-            "limit_order": {
-                "stop_loss": round(RIESGO_MAX_USD, 2),
-                "take_profit": round(BENEFICIO_MIN_USD, 2),
-            },
-        }))["proposal"]
-        compra = (await DERIV.request({"buy": prop["id"],
-                                       "price": prop["ask_price"]}))["buy"]
-        contrato = str(compra["contract_id"])
+async def ciclo_automatico(bot) -> Ninguno: 
+lectura = await leer_mercado() 
+si lectura es Ninguno o lectura.epoch == ESTADO.ultima_vela: 
+regresa 
+ESTADO.ultima_vela = lectura.epoch 
+si no lectura.vol_inst: 
+regresa
+if lectura.z >= Z_UMBRAL y lectura.cierre > lectura.ema_macro: 
+direccion = 1 
+elif lectura.z <= -Z_UMBRAL y lectura.cierre < lectura.ema_macro: 
+direccion = -1 
+else: 
+return
+plan, motivo = planificar(direccion, lectura.precio_vivo, lectura.atr) 
+si el plan es Ninguno: 
+log.info("Señal automática descartada: %s", motivo) 
+return 
+try: 
+await abrir_operacion(plan, bot) 
+excepto Excepción como e: 
+log.warning("Orden automática no enviada: %s", e)
+async def bucle_automatico(bot) -> Ninguno: 
+while True: 
+if ESTADO.auto_activo: 
+try: 
+await ciclo_automatico(bot) 
+excepto Excepción: 
+log.exception("Error en el ciclo automático") 
+await asyncio.sleep(INTERVALO_AUTO)
 
-    await bot.send_message(chat_id=CHAT_ID, text=texto_alerta(plan))
-    tarea = asyncio.create_task(vigilar_contrato(contrato, bot))
-    ESTADO.vigilancias.add(tarea)
-    tarea.add_done_callback(ESTADO.vigilancias.discard)
-    return contrato
-
-
-async def vigilar_contrato(contrato: str, bot) -> None:
-    while True:
-        await asyncio.sleep(5)
-        try:
-            r = await DERIV.request({"proposal_open_contract": 1,
-                                     "contract_id": contrato})
-        except Exception as e:
-            log.warning("No pude consultar el contrato %s: %s", contrato, e)
-            continue
-        c = r["proposal_open_contract"]
-        if c.get("is_sold"):
-            resultado = float(c.get("profit", 0.0))
-            try:
-                await bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"🏁 Contrato {contrato} cerrado. Resultado: ${resultado:+.2f}")
-            except Exception as e:
-                log.warning("No pude notificar el cierre: %s", e)
-            return
+═══════════════════════════════════════════════════════════════
 
 
-async def resumen_resultados(desde: int | None) -> tuple[int, float]:
-    payload = {"profit_table": 1, "description": 1, "sort": "DESC", "limit": 100}
-    if desde is not None:
-        payload["date_from"] = desde
-    r = await DERIV.request(payload)
-    txs = r["profit_table"].get("transactions", [])
-    ganancia = sum(float(t.get("sell_price", 0)) - float(t.get("buy_price", 0))
-                   for t in txs)
-    return len(txs), ganancia
+7. TELEGRAM: menú, modo manual y comandos
 
 
-async def texto_ganancias() -> str:
-    ahora = datetime.now(timezone.utc)
-    inicio_dia = int(ahora.replace(hour=0, minute=0, second=0,
-                                   microsecond=0).timestamp())
-    n_hoy, g_hoy = await resumen_resultados(inicio_dia)
-    n_tot, g_tot = await resumen_resultados(None)
-    saldo = (await DERIV.request({"balance": 1}))["balance"]
-    return (f"💰 Ganancias (cuenta Deriv)\n"
-            f"Hoy: ${g_hoy:+.2f} en {n_hoy} operaciones\n"
-            f"Últimas {n_tot} operaciones: ${g_tot:+.2f}\n"
-            f"Saldo actual: ${float(saldo['balance']):.2f} {saldo.get('currency', 'USD')}")
+═══════════════════════════════════════════════════════════════
+
+def solo_dueno(func): 
+@functools.wraps(func) 
+async def envoltorio(update: Update, context: ContextTypes.DEFAULT_TYPE): 
+chat = update.effective_chat 
+if chat is None or chat.id != CHAT_ID: 
+return 
+return await func(update, context) 
+return envoltorio
+def texto_menu() -> str: 
+cuenta = "sin conexión" 
+if DERIV no es Ninguno y DERIV.info: 
+tipo = "DEMO" if DERIV.info.get("is_virtual") else "REAL" 
+cuenta = f"{DERIV.info.get('loginid')} ({tipo})" 
+auto = "ACTIVO" if ESTADO.auto_activo else "apagado" 
+return f"🤖 Bot híbrido · {SYMBOL}\nCuenta: {cuenta}\nModo automático: {auto}\nStake ${STAKE:.2f} · riesgo ${RIESGO_MAX_USD:.2f} · beneficio ${BENEFICIO_MIN_USD:.2f}"
+def teclado_menu() -> InlineKeyboardMarkup: 
+if ESTADO.auto_activo: 
+boton_auto = InlineKeyboardButton("⏸ Detener Modo Automático", callback_data="auto:off") 
+else: 
+boton_auto = InlineKeyboardButton("▶️ Modo Automático", callback_data="auto:on") 
+return InlineKeyboardMarkup([ 
+[InlineKeyboardButton("🧭 Modo Manual", callback_data="manual")], 
+[boton_auto], 
+[InlineKeyboardButton("💰 Ganancias", callback_data="ganancias")], 
+])
+def boton_volver() -> InlineKeyboardMarkup: 
+return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]])
+async def editar(q, texto: str, markup=None) -> None: 
+try: 
+await q.edit_message_text(texto, reply_markup=markup) 
+except BadRequest as e: 
+if "not modified" not in str(e).lower(): 
+raise
+def texto_lectura(l: Lectura, planes: dict, motivos: dict) -> str: 
+hora = datetime.fromtimestamp(l.epoch, timezone.utc).strftime("%H:%M UTC") 
+tendencia = "alcista" if l.cierre > l.ema_macro else "bajista" 
+lineas = [ 
+f"📊 {SYMBOL} · vela cerrada {hora}", 
+f"Precio: {fmt(redondear(l.precio_vivo))}", 
+f"Z-Score (20): {lz:+.2f}", 
+f"ATR (14): {l.atr:.5f}", 
+f"Tendencia (EMA 200): {tendencia}", 
+f"Volumen institucional (proxy): {'sí' if l.vol_inst else 'no'}", 
+] 
+for d, nombre in ((1, "COMPRA"), (-1, "VENTA")): 
+si d en planos: 
+p = planes[d] 
+lineas.append(f"{nombre}: SL {fmt(p.sl)} · TP {fmt(p.tp)} · x{p.multiplicador} · riesgo ${p.riesgo_usd:.2f} · beneficio ${p.beneficio_usd:.2f}") 
+else: 
+lineas.append(f"{nombre}: descartada ({motivos[d]})") 
+return "\n".join(lineas)
+async def mostrar_menu_manual(q) -> Ninguno: 
+await editar(q, "Analizando el mercado…") 
+lectura = await leer_mercado() 
+si lectura es Ninguno: 
+await editar(q, "Datos insuficientes por ahora (faltan velas o ticks).", boton_volver()) 
+return
+planos, motivos = {}, {} 
+for d in (1, -1): 
+plan, motivo = planificar(d, lectura.precio_vivo, lectura.atr) 
+if plan: 
+planos[d] = plan 
+else: 
+motivos[d] = motivo
+botones = [] 
+if 1 en planos: 
+botones.append(InlineKeyboardButton(f"✅ Comprar ${STAKE:.2f}", callback_data="ejecutar:1")) 
+if -1 en planos: 
+botones.append(InlineKeyboardButton(f"🔻 Vender ${STAKE:.2f}", callback_data="ejecutar:-1")) 
+filas = [botones] if botones else [] 
+filas.append([InlineKeyboardButton("⬅️ Menú", callback_data="menu")]) 
+await editar(q, texto_lectura(lectura, planos, motivos), InlineKeyboardMarkup(filas))
+async def ejecutar_manual(q, direccion: int, bot) -> None: 
+await editar(q, "Recalculando la señal y enviando la orden…") 
+lectura = await leer_mercado() 
+if lectura is None: 
+rise RuntimeError("datos insuficientes para recalcular") 
+plan, motivo = planificar(direccion, lectura.precio_vivo, lectura.atr) 
+if plan is None: 
+await editar(q, f"Señal descartada al confirmar: {motivo}", boton_volver()) 
+return 
+contrato = await abrir_operacion(plan, bot) 
+await editar(q, f"Orden enviada (contrato {contrato}).", boton_volver())
+@solo_dueno 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE): 
+await update.message.reply_text(texto_menu(), reply_markup=teclado_menu())
+@solo_dueno 
+async def cmd_ganancias(update: Update, context: ContextTypes.DEFAULT_TYPE): 
+try: 
+texto = await texto_ganancias() 
+except Exception as e: 
+log.exception("Error en /ganancias") 
+texto = f"No pude consultar las ganancias: {e}" 
+await update.message.reply_text(texto)
+@solo_dueno 
+async def on_boton(update: Update, context: ContextTypes.DEFAULT_TYPE): 
+q = update.callback_query 
+await q.answer() dato 
+= q.data 
+try: 
+if dato == "menu": 
+await editar(q, texto_menu(), teclado_menu()) 
+elif dato == "manual": 
+await mostrar_menu_manual(q) 
+elif dato.startswith("ejecutar:"): 
+await ejecutar_manual(q, int(dato.split(":")[1]), context.bot) 
+elif dato == "auto:on": 
+ESTADO.auto_activo = True 
+await editar(q, texto_menu(), teclado_menu()) 
+elif dato == "auto:off": 
+ESTADO.auto_activo = False 
+await editar(q, texto_menu(), teclado_menu()) 
+elif dato == "ganancias": 
+await editar(q, await texto_ganancias(), boton_volver()) 
+excepto Excepción como e: 
+log.exception("Error en el botón %s", dato) 
+await editar(q, f"Error: {e}", boton_volver())
+
+═══════════════════════════════════════════════════════════════
 
 
-# ═════════════════════════════════════════════════════════════════
-#  6. MODO AUTOMÁTICO
-#  Una revisión por vela cerrada. Señal: volumen institucional (proxy
-#  > media × 2.5) + |Z| >= 2 a favor de la tendencia EMA 200.
-# ═════════════════════════════════════════════════════════════════
-async def ciclo_automatico(bot) -> None:
-    lectura = await leer_mercado()
-    if lectura is None or lectura.epoch == ESTADO.ultima_vela:
-        return
-    ESTADO.ultima_vela = lectura.epoch
-    if not lectura.vol_inst:
-        return
-
-    if lectura.z >= Z_UMBRAL and lectura.cierre > lectura.ema_macro:
-        direccion = 1
-    elif lectura.z <= -Z_UMBRAL and lectura.cierre < lectura.ema_macro:
-        direccion = -1
-    else:
-        return
-
-    plan, motivo = planificar(direccion, lectura.precio_vivo, lectura.atr)
-    if plan is None:
-        log.info("Señal automática descartada: %s", motivo)
-        return
-    try:
-        await abrir_operacion(plan, bot)
-    except Exception as e:
-        log.warning("Orden automática no enviada: %s", e)
+8. ARRANQUE Y APAGADO
 
 
-async def bucle_automatico(bot) -> None:
-    while True:
-        if ESTADO.auto_activo:
-            try:
-                await ciclo_automatico(bot)
-            except Exception:
-                log.exception("Error en el ciclo automático")
-        await asyncio.sleep(INTERVALO_AUTO)
+═══════════════════════════════════════════════════════════════
 
-
-# ═════════════════════════════════════════════════════════════════
-#  7. TELEGRAM: menú, modo manual y comandos
-# ═════════════════════════════════════════════════════════════════
-def solo_dueno(func):
-    @functools.wraps(func)
-    async def envoltorio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat = update.effective_chat
-        if chat is None or chat.id != CHAT_ID:
-            return
-        return await func(update, context)
-    return envoltorio
-
-
-def texto_menu() -> str:
-    cuenta = "sin conexión"
-    if DERIV is not None and DERIV.info:
-        tipo = "DEMO" if DERIV.info.get("is_virtual") else "REAL"
-        cuenta = f"{DERIV.info.get('loginid')} ({tipo})"
-    auto = "ACTIVO" if ESTADO.auto_activo else "apagado"
-    return (f"🤖 Bot híbrido · {SYMBOL}\nCuenta: {cuenta}\n"
-            f"Modo automático: {auto}\n"
-            f"Stake ${STAKE:.2f} · riesgo ${RIESGO_MAX_USD:.2f} · "
-            f"beneficio ${BENEFICIO_MIN_USD:.2f}")
-
-
-def teclado_menu() -> InlineKeyboardMarkup:
-    if ESTADO.auto_activo:
-        boton_auto = InlineKeyboardButton("⏸ Detener Modo Automático", callback_data="auto:off")
-    else:
-        boton_auto = InlineKeyboardButton("▶️ Modo Automático", callback_data="auto:on")
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧭 Modo Manual", callback_data="manual")],
-        [boton_auto],
-        [InlineKeyboardButton("💰 Ganancias", callback_data="ganancias")],
-    ])
-
-
-def boton_volver() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]])
-
-
-async def editar(q, texto: str, markup=None) -> None:
-    try:
-        await q.edit_message_text(texto, reply_markup=markup)
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            raise
-
-
-def texto_lectura(l: Lectura, planes: dict, motivos: dict) -> str:
-    hora = datetime.fromtimestamp(l.epoch, timezone.utc).strftime("%H:%M UTC")
-    tendencia = "alcista" if l.cierre > l.ema_macro else "bajista"
-    lineas = [
-        f"📊 {SYMBOL} · vela cerrada {hora}",
-        f"Precio: {fmt(redondear(l.precio_vivo))}",
-        f"Z-Score (20): {l.z:+.2f}",
-        f"ATR (14): {l.atr:.5f}",
-        f"Tendencia (EMA 200): {tendencia}",
-        f"Volumen institucional (proxy): {'sí' if l.vol_inst else 'no'}",
-    ]
-    for d, nombre in ((1, "COMPRA"), (-1, "VENTA")):
-        if d in planes:
-            p = planes[d]
-            lineas.append(f"{nombre}: SL {fmt(p.sl)} · TP {fmt(p.tp)} · "
-                          f"x{p.multiplicador} · riesgo ${p.riesgo_usd:.2f} · "
-                          f"beneficio ${p.beneficio_usd:.2f}")
-        else:
-            lineas.append(f"{nombre}: descartada ({motivos[d]})")
-    return "\n".join(lineas)
-
-
-async def mostrar_menu_manual(q) -> None:
-    await editar(q, "Analizando el mercado…")
-    lectura = await leer_mercado()
-    if lectura is None:
-        await editar(q, "Datos insuficientes por ahora (faltan velas o ticks).",
-                     boton_volver())
-        return
-
-    planes, motivos = {}, {}
-    for d in (1, -1):
-        plan, motivo = planificar(d, lectura.precio_vivo, lectura.atr)
-        if plan:
-            planes[d] = plan
-        else:
-            motivos[d] = motivo
-
-    botones = []
-    if 1 in planes:
-        botones.append(InlineKeyboardButton(f"✅ Comprar ${STAKE:.2f}", callback_data="ejecutar:1"))
-    if -1 in planes:
-        botones.append(InlineKeyboardButton(f"🔻 Vender ${STAKE:.2f}", callback_data="ejecutar:-1"))
-    filas = [botones] if botones else []
-    filas.append([InlineKeyboardButton("⬅️ Menú", callback_data="menu")])
-    await editar(q, texto_lectura(lectura, planes, motivos),
-                 InlineKeyboardMarkup(filas))
-
-
-async def ejecutar_manual(q, direccion: int, bot) -> None:
-    await editar(q, "Recalculando la señal y enviando la orden…")
-    lectura = await leer_mercado()
-    if lectura is None:
-        raise RuntimeError("datos insuficientes para recalcular")
-    plan, motivo = planificar(direccion, lectura.precio_vivo, lectura.atr)
-    if plan is None:
-        await editar(q, f"Señal descartada al confirmar: {motivo}", boton_volver())
-        return
-    contrato = await abrir_operacion(plan, bot)
-    await editar(q, f"Orden enviada (contrato {contrato}).", boton_volver())
-
-
-@solo_dueno
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(texto_menu(), reply_markup=teclado_menu())
-
-
-@solo_dueno
-async def cmd_ganancias(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        texto = await texto_ganancias()
-    except Exception as e:
-        log.exception("Error en /ganancias")
-        texto = f"No pude consultar las ganancias: {e}"
-    await update.message.reply_text(texto)
-
-
-@solo_dueno
-async def on_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    dato = q.data
-    try:
-        if dato == "menu":
-            await editar(q, texto_menu(), teclado_menu())
-        elif dato == "manual":
-            await mostrar_menu_manual(q)
-        elif dato.startswith("ejecutar:"):
-            await ejecutar_manual(q, int(dato.split(":")[1]), context.bot)
-        elif dato == "auto:on":
-            ESTADO.auto_activo = True
-            await editar(q, texto_menu(), teclado_menu())
-        elif dato == "auto:off":
-            ESTADO.auto_activo = False
-            await editar(q, texto_menu(), teclado_menu())
-        elif dato == "ganancias":
-            await editar(q, await texto_ganancias(), boton_volver())
-    except Exception as e:
-        log.exception("Error en el botón %s", dato)
-        await editar(q, f"Error: {e}", boton_volver())
-
-
-# ═════════════════════════════════════════════════════════════════
-#  8. ARRANQUE Y APAGADO
-# ═════════════════════════════════════════════════════════════════
-async def on_init(app: Application) -> None:
-    global DERIV
-    ESTADO.lock = asyncio.Lock()
-    DERIV = DerivClient(DERIV_TOKEN, DERIV_URL)
-    DERIV.iniciar()
-    ESTADO.tareas.append(asyncio.create_task(keep_alive(RENDER_URL)))
-    ESTADO.tareas.append(asyncio.create_task(bucle_automatico(app.bot)))
-    log.info("Servicio iniciado. Keep-alive cada %d s hacia %s",
-             INTERVALO_KEEPALIVE, RENDER_URL)
-
-
-async def on_shutdown(app: Application) -> None:
-    for t in ESTADO.tareas:
-        t.cancel()
-    if DERIV is not None:
-        await DERIV.detener()
-
-
-def main() -> None:
-    iniciar_servidor_web()
-    app = (Application.builder()
-           .token(TELEGRAM_TOKEN)
-           .post_init(on_init)
-           .post_shutdown(on_shutdown)
-           .build())
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("ganancias", cmd_ganancias))
-    app.add_handler(CallbackQueryHandler(on_boton))
-    app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
-    main()
+async def on_init(app: Application) -> None: 
+global DERIV 
+ESTADO.lock = asyncio.Lock() 
+DERIV = DerivClient(DERIV_TOKEN, DERIV_URL) 
+DERIV.iniciar() 
+ESTADO.tareas.append(asyncio.create_task(keep_alive(RENDER_URL))) 
+ESTADO.tareas.append(asyncio.create_task(bucle_automatico(app.bot))) 
+log.info("Servicio iniciado. Keep-alive cada %ds hacia %s", INTERVALO_KEEPALIVE, RENDER_URL)
+async def on_shutdown(app: Application) -> None: 
+for t in ESTADO.tareas: 
+t.cancel() 
+if DERIV is not None: 
+await DERIV.detener()
+def main() -> None: 
+iniciar_servidor_web() 
+app = (Application.builder() 
+.token(TELEGRAM_TOKEN) 
+.post_init(on_init) 
+.post_shutdown(on_shutdown) 
+.build()) 
+app.add_handler(CommandHandler("start", cmd_start)) 
+app.add_handler(CommandHandler("ganancias", cmd_ganancias)) 
+app.add_handler(CallbackQueryHandler(on_boton)) 
+app.run_polling(drop_pending_updates=True)
+Si nombre == " main ": 
+main()
