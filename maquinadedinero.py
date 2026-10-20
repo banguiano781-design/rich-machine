@@ -1,4 +1,4 @@
-"""maquinadedinero.py: bot híbrido (Modo Manual y Modo Automático) para Deriv, controlado desde Telegram y desplegado como Web Service gratuito en Render."""
+ """maquinadedinero.py: bot híbrido (Modo Manual y Modo Automático) para Deriv, controlado desde Telegram y desplegado como Web Service gratuito en Render."""
 from __future__ import annotations
 
 import asyncio
