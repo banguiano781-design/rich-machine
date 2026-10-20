@@ -22,6 +22,8 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("maquinadedinero")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0").strip() or "0")
