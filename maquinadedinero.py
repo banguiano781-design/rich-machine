@@ -1,10 +1,3 @@
-El deploy se caía en la línea 274: el `if` no tenía cuerpo indentado y `Ninguno` no es Python. El script nuevo compila y, cuando descarta una orden, hace `return None, "motivo"`.
-
-La URL que pediste (`wss://://derivws.com`) no conecta. Quedó la del API real: `wss://ws.derivws.com/websockets/v3?app_id=...`. El keep-alive usa `RENDER_URL` y, si no está definida, `https://rich-machine-1.onrender.com`.
-
-Start command: `python maquinadedinero.py`.
-
-```python
 import asyncio
 import json
 import logging
