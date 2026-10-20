@@ -266,27 +266,27 @@ class Plan:
 
 def planificar(direccion: int, entrada: float, atr: float) -> tuple[Plan | None, str]:
     if not atr or atr <= 0:
-        return None, "ATR no válido"
+        return None, "ATR no valido"
     dist_min = SL_ATR_MULT * atr
     cota = RIESGO_MAX_USD * entrada / (STAKE * dist_min)
     candidatos = [m for m in MULTIPLICADORES if m <= cota]
     if not candidatos:
-return Ninguno, f"con ${RIESGO_MAX_USD:.2f} de riesgo el SL quedaría dentro del ruido (menos de {SL_ATR_MULT} ATR)" 
+return Ninguno, f"Riesgo excedido" 
 m = max(candidatos) 
 dist_sl = RIESGO_MAX_USD * entrada / (STAKE * m) 
 dist_tp = RATIO_RR * dist_sl 
 riesgo = dist_sl * STAKE * m / entrada 
 beneficio = dist_tp * STAKE * m / entrada 
-if riesgo > RIESGO_MAX_USD + 1e-9 or beneficio < BENEFICIO_MIN_USD - 1e-9: 
-return Ninguno, "no cumple el filtro de riesgo y beneficio" 
+if riesgo > RIESGO_MAX_USD + 1e-9 o beneficio < BENEFICIO_MIN_USD - 1e-9: 
+return Ninguno, "Fallo en filtro de riesgo" 
 plan = Plan(direccion=direccion, multiplicador=m, entrada=entrada, sl=redondear(entrada - direccion * dist_sl), tp=redondear(entrada + direccion * dist_tp), riesgo_usd=riesgo, beneficio_usd=beneficio) 
-plan de retorno, ""
+return plan, ""
 def fmt(precio: float) -> str: 
 return f"{precio:.7f}".rstrip("0").rstrip(".")
 def texto_alerta(plan: Plan) -> str: 
 tendencia = "alcista" if plan.direccion > 0 else "bajista" 
 operacion = "compra" if plan.direccion > 0 else "venta" 
-return f"la tendencia es '{tendencia}' cuanto quieres ganar {fmt(plan.tp)} y cuanto es el stop lose {fmt(plan.sl)}; entré en {operacion}"
+return f"la tendencia es '{tendencia}' cuanto quieres ganar {fmt(plan.tp)} y cuanto es el stop lose {fmt(plan.sl)}; entre en {operacion}"
 
 # ═══════════════════════════════════════════════════════════════
 #  5. EJECUCIÓN Y SEGUIMIENTO
@@ -307,9 +307,9 @@ rise RuntimeError("El token no coincide con MODO_REAL. Con MODO_REAL=false solo 
 async def abrir_operacion(plan: Plan, bot) -> str: 
 async with ESTADO.lock: 
 verificar_modo() 
-abiertas = await DERIV.request({"portfolio": 1}) 
-if abiertas["portfolio"].get("contracts"): 
-rise RuntimeError("ya hay una operación abierta; espero a que cierre")
+abiertos = await DERIV.request({"portfolio": 1}) 
+if abierto["portfolio"].get("contracts"): 
+rise RuntimeError("ya hay una operacion abierta; espero a que cierre")
 tipo = "MULTUP" if plan.direccion > 0 else "MULTDOWN" 
 prop = (await DERIV.request({ 
 "proposal": 1, 
@@ -343,7 +343,7 @@ c = r["proposal_open_contract"]
 if c.get("is_sold"): 
 resultado = float(c.get("profit", 0.0)) 
 try: 
-await bot.send_message(chat_id=CHAT_ID, text=f"🏁 Contrato {contrato} cerrado. Resultado: ${resultado:+.2f}") 
+await bot.send_message(chat_id=CHAT_ID, text=f"Contrato {contrato} cerrado. Resultado: ${resultado:+.2f}") 
 excepto excepción como e: 
 log.warning("No pude notificar el cierre: %s", e) 
 return
@@ -361,7 +361,7 @@ inicio_dia = int(ahora.replace(hora=0, minuto=0, segundo=0, microsegundo=0).time
 n_hoy, g_hoy = await resumen_resultados(inicio_dia) 
 n_tot, g_tot = await resumen_resultados(None) 
 saldo = (await DERIV.request({"balance": 1}))["balance"] 
-return f"💰 Ganancias (cuenta Deriv)\nHoy: ${g_hoy:+.2f} en {n_hoy} operaciones\nÚltimas {n_tot} operaciones: ${g_tot:+.2f}\nSaldo actual: ${float(saldo['balance']):.2f} {saldo.get('moneda', 'USD')}"
+return f"Ganancias (cuenta Deriv)\nHoy: ${g_hoy:+.2f} en {n_hoy} operaciones\nUltimas {n_tot} operaciones: ${g_tot:+.2f}\nSaldo actual: ${float(saldo['balance']):.2f} {saldo.get('currency', 'DÓLAR ESTADOUNIDENSE')}"
 
 # ═══════════════════════════════════════════════════════════════
 #  6. MODO AUTOMÁTICO
@@ -382,12 +382,12 @@ else:
 return
 plan, motivo = planificar(direccion, lectura.precio_vivo, lectura.atr) 
 si el plan es Ninguno: 
-log.info("Señal automática descartada: %s", motivo) 
+log.info("Senal automatica descartada: %s", motivo) 
 return 
 try: 
 await abrir_operacion(plan, bot) 
-excepto Excepción como e: 
-log.warning("Orden automática no enviada: %s", e)
+except Exception as e: 
+log.warning("Orden automatica no enviada: %s", e)
 async def bucle_automatico(bot) -> Ninguno: 
 while True: 
 if ESTADO.auto_activo: 
@@ -398,7 +398,7 @@ log.exception("Error en el ciclo automático")
 await asyncio.sleep(INTERVALO_AUTO)
 
 # ═══════════════════════════════════════════════════════════════
-#  7. TELEGRAM: menú, modo manual y comandos
+# 7. TELEGRAM: menú, modo manual y comandos
 # ═══════════════════════════════════════════════════════════════
 
 def solo_dueno(func): 
@@ -415,21 +415,21 @@ if DERIV no es Ninguno y DERIV.info:
 tipo = "DEMO" if DERIV.info.get("is_virtual") else "REAL" 
 cuenta = f"{DERIV.info.get('loginid')} ({tipo})" 
 auto = "ACTIVO" if ESTADO.auto_activo else "apagado" 
-return f"🤖 Bot híbrido · {SYMBOL}\nCuenta: {cuenta}\nModo automático: {auto}\nStake ${STAKE:.2f} · riesgo ${RIESGO_MAX_USD:.2f} · beneficio ${BENEFICIO_MIN_USD:.2f}"
+return f"Bot hibrido · {SYMBOL}\nCuenta: {cuenta}\nModo automático: {auto}\nStake ${STAKE:.2f} · riesgo ${RIESGO_MAX_USD:.2f} · beneficio ${BENEFICIO_MIN_USD:.2f}"
 def teclado_menu() -> InlineKeyboardMarkup: 
 if ESTADO.auto_activo: 
-boton_auto = InlineKeyboardButton("⏸ Detener Modo Automático", callback_data="auto:off") 
+boton_auto = InlineKeyboardButton("Detener Modo Automatico", callback_data="auto:off") 
 else: 
-boton_auto = InlineKeyboardButton("▶️ Modo Automático", callback_data="auto:on") 
+boton_auto = InlineKeyboardButton("Modo Automatico", callback_data="auto:on") 
 return InlineKeyboardMarkup([ 
-[InlineKeyboardButton("🧭 Modo Manual", callback_data="manual")], 
+[InlineKeyboardButton("Modo Manual", callback_data="manual")], 
 [boton_auto], 
-[InlineKeyboardButton("💰 Ganancias", callback_data="ganancias")], 
+[InlineKeyboardButton("Ganancias", callback_data="ganancias")], 
 ])
 def boton_volver() -> InlineKeyboardMarkup: 
-return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menú", callback_data="menu")]])
+return InlineKeyboardMarkup([[InlineKeyboardButton("Menú", callback_data="menú")]])
 async def editar(q, texto: str, markup=None) -> None: 
-try: 
+try:
 await q.edit_message_text(texto, reply_markup=markup) 
 except BadRequest as e: 
 if "not modified" not in str(e).lower(): 
@@ -438,22 +438,22 @@ def texto_lectura(l: Lectura, planes: dict, motivos: dict) -> str:
 hora = datetime.fromtimestamp(l.epoch, timezone.utc).strftime("%H:%M UTC") 
 tendencia = "alcista" if l.cierre > l.ema_macro else "bajista" 
 lineas = [ 
-f"📊 {SYMBOL} · vela cerrada {hora}", 
+f"{SYMBOL} · vela cerrada {hora}", 
 f"Precio: {fmt(redondear(l.precio_vivo))}", 
 f"Z-Score (20): {lz:+.2f}", 
 f"ATR (14): {l.atr:.5f}", 
 f"Tendencia (EMA 200): {tendencia}", 
-f"Volumen institucional (proxy): {'sí' if l.vol_inst else 'no'}", 
+f"Volumen institucional (proxy): {'si' if l.vol_inst else 'no'}", 
 ] 
 for d, nombre in ((1, "COMPRA"), (-1, "VENTA")): 
 si d en planos: 
-p = planes[d] 
+p = planos[d] 
 lineas.append(f"{nombre}: SL {fmt(p.sl)} · TP {fmt(p.tp)} · x{p.multiplicador} · riesgo ${p.riesgo_usd:.2f} · beneficio ${p.beneficio_usd:.2f}") 
 else: 
 lineas.append(f"{nombre}: descartada ({motivos[d]})") 
 return "\n".join(lineas)
 async def mostrar_menu_manual(q) -> Ninguno: 
-await editar(q, "Analizando el mercado…") 
+await editar(q, "Analizando el mercado...") 
 lectura = await leer_mercado() 
 si lectura es Ninguno: 
 await editar(q, "Datos insuficientes por ahora (faltan velas o ticks).", boton_volver()) 
@@ -467,20 +467,20 @@ else:
 motivos[d] = motivo
 botones = [] 
 if 1 en planos: 
-botones.append(InlineKeyboardButton(f"✅ Comprar ${STAKE:.2f}", callback_data="ejecutar:1")) 
+botones.append(InlineKeyboardButton(f"Comprar ${STAKE:.2f}", callback_data="ejecutar:1")) 
 if -1 en planos: 
-botones.append(InlineKeyboardButton(f"🔻 Vender ${STAKE:.2f}", callback_data="ejecutar:-1")) 
+botones.append(InlineKeyboardButton(f"Vender ${STAKE:.2f}", callback_data="ejecutar:-1")) 
 filas = [botones] if botones else [] 
-filas.append([InlineKeyboardButton("⬅️ Menú", callback_data="menu")]) 
+filas.append([InlineKeyboardButton("Menu", callback_data="menu")]) 
 await editar(q, texto_lectura(lectura, planos, motivos), InlineKeyboardMarkup(filas))
 async def ejecutar_manual(q, direccion: int, bot) -> None: 
-await editar(q, "Recalculando la señal y enviando la orden…") 
+await editar(q, "Recalculando la señal y enviando la orden...") 
 lectura = await leer_mercado() 
 if lectura is None: 
 rise RuntimeError("datos insuficientes para recalcular") 
 plan, motivo = planificar(direccion, lectura.precio_vivo, lectura.atr) 
 if plan is None: 
-await editar(q, f"Señal descartada al confirmar: {motivo}", boton_volver()) 
+await editar(q, f"Senal descartada al confirmar: {motivo}", boton_volver()) 
 return 
 contrato = await abrir_operacion(plan, bot) 
 await editar(q, f"Orden enviada (contrato {contrato}).", boton_volver())
@@ -498,14 +498,14 @@ await update.message.reply_text(texto)
 @solo_dueno 
 async def on_boton(update: Update, context: ContextTypes.DEFAULT_TYPE): 
 q = update.callback_query 
-await q.answer() dato 
-= q.data 
+await q.answer() 
+dato = q.data 
 try: 
 if dato == "menu": 
 await editar(q, texto_menu(), teclado_menu()) 
-elif dato == "manual": 
-await mostrar_menu_manual(q) 
-elif dato.startswith("ejecutar:"): 
+elif dato == "manual":
+ await mostrar_menu_manual(q)
+ elif dato.startswith("ejecutar:"): 
 await ejecutar_manual(q, int(dato.split(":")), context.bot) 
 elif dato == "auto:on": 
 ESTADO.auto_activo = True 
@@ -519,9 +519,13 @@ excepto Excepción como e:
 log.exception("Error en el botón %s", dato) 
 await editar(q, f"Error: {e}", boton_volver())
 
-# ═══════════════════════════════════════════════════════════════
-#  8. ARRANQUE Y APAGADO
-# ═══════════════════════════════════════════════════════════════
+═══════════════════════════════════════════════════════════════
+
+
+8. ARRANQUE Y APAGADO
+
+
+═══════════════════════════════════════════════════════════════
 
 async def on_init(app: Application) -> None: 
 global DERIV 
@@ -536,8 +540,8 @@ for t in ESTADO.tareas:
 t.cancel() 
 if DERIV is not None: 
 await DERIV.detener()
-def main() -> None: 
-iniciar_servidor_web() 
+def main() -> Ninguno:
+ iniciar_servidor_web() 
 app = (Application.builder() 
 .token(TELEGRAM_TOKEN) 
 .post_init(on_init) 
