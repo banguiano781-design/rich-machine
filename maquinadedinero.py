@@ -519,13 +519,9 @@ excepto Excepción como e:
 log.exception("Error en el botón %s", dato) 
 await editar(q, f"Error: {e}", boton_volver())
 
-═══════════════════════════════════════════════════════════════
-
-
-8. ARRANQUE Y APAGADO
-
-
-═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  8. ARRANQUE Y APAGADO
+# ═══════════════════════════════════════════════════════════════
 
 async def on_init(app: Application) -> None: 
 global DERIV 
