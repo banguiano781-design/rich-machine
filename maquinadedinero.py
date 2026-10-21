@@ -24,6 +24,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("maquinadedinero")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+CABECERAS_WS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Origin": "https://developers.deriv.com",
+}
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0").strip() or "0")
@@ -145,7 +149,7 @@ class DerivClient:
         espera = 2
         while True:
             try:
-                async with websockets.connect(self.url, ping_interval=20, ping_timeout=20) as ws:
+                async with websockets.connect(url, additional_headers=CABECERAS_WS, ping_interval=20, ping_timeout=20) as ws:
                     self.ws = ws
                     await ws.send(json.dumps({"authorize": self.token}))
                     resp = json.loads(await ws.recv())
