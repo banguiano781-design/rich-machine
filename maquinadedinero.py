@@ -1,4 +1,4 @@
-"maquinadedinero.py: bot híbrido (Modo Manual y Modo Automático) para Deriv, controlado desde Telegram y desplegado como Web Service gratuito en Render."
+"""maquinadedinero.py: bot híbrido para Deriv (API nueva, con OTP) con Modo Manual y Modo Automático, controlado desde Telegram y desplegado como Web Service gratuito en Render."""
 from __future__ import annotations
 
 import asyncio
@@ -21,56 +21,61 @@ from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("maquinadedinero")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
-CABECERAS_WS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-    "Origin": "https://developers.deriv.com",
-}
+log = logging.getLogger("maquinadedinero")
+
+API_BASE = "https://api.derivws.com"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0").strip() or "0")
 DERIV_TOKEN = os.environ.get("DERIV_TOKEN", "").strip()
-DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089").strip()
-DERIV_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
-
-SYMBOL = os.environ.get("DERIV_SYMBOL", "R_100").strip()
+DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "").strip()
 MODO_REAL = os.environ.get("MODO_REAL", "false").strip().lower() == "true"
-MULTIPLICADORES = sorted({int(x) for x in os.environ.get("MULTIPLICADORES", "10,20,30,40,50,100,200").split(",") if x.strip()})
+
+SYMBOL = os.environ.get("DERIV_SYMBOL", "frxXAUUSD").strip()
+MULTIPLICADORES = sorted({int(x) for x in os.environ.get("MULTIPLICADORES", "50").split(",") if x.strip()})
+STAKE = float(os.environ.get("STAKE", "1.00"))
+RIESGO_USD = float(os.environ.get("RIESGO_USD", "0.10"))
+BENEFICIO_USD = float(os.environ.get("BENEFICIO_USD", "0.40"))
+COMISION_USD = float(os.environ.get("COMISION_USD", "0.02"))
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://rich-machine-1.onrender.com").strip()
 PORT = int(os.environ.get("PORT", "5000"))
 
-STAKE = 0.50
-RIESGO_MAX_USD = 0.05
-BENEFICIO_MIN_USD = 0.15
-RATIO_RR = 3.0
 SL_ATR_MULT = 1.5
-
 ZLEN = 20
 ATR_LEN = 14
 EMA_MACRO = 200
 VOL_LEN = 20
 VOL_MULT = 2.5
 Z_EXTREMO = 2.5
-
 GRANULARIDAD = 60
 VELAS = 300
 TICKS = 5000
 INTERVALO_KEEPALIVE = 600
 INTERVALO_AUTO = 20
+CABECERAS_WS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+    "Origin": "https://developers.deriv.com",
+}
+
+
+class DerivError(Exception):
+    pass
 
 
 def validar_configuracion() -> None:
-    faltantes = []
-    if not TELEGRAM_TOKEN:
-        faltantes.append("TELEGRAM_TOKEN")
-    if not CHAT_ID:
-        faltantes.append("TELEGRAM_CHAT_ID")
-    if not DERIV_TOKEN:
-        faltantes.append("DERIV_TOKEN")
+    requeridas = {
+        "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+        "TELEGRAM_CHAT_ID": CHAT_ID,
+        "DERIV_TOKEN": DERIV_TOKEN,
+        "DERIV_APP_ID": DERIV_APP_ID,
+    }
+    faltantes = [nombre for nombre, valor in requeridas.items() if not valor]
     if faltantes:
         raise SystemExit("Faltan variables de entorno: " + ", ".join(faltantes))
+    if RIESGO_USD <= COMISION_USD:
+        raise SystemExit("RIESGO_USD debe ser mayor que COMISION_USD")
 
 
 flask_app = Flask(__name__)
@@ -100,16 +105,50 @@ async def keep_alive(url: str) -> None:
             log.warning("Keep-alive falló: %s", e)
 
 
-class DerivError(Exception):
-    pass
+def _rest(metodo: str, ruta: str, cuerpo: dict | None = None) -> dict:
+    cabeceras = {"Authorization": f"Bearer {DERIV_TOKEN}", "Deriv-App-ID": DERIV_APP_ID}
+    resp = requests.request(metodo, f"{API_BASE}{ruta}", headers=cabeceras, json=cuerpo, timeout=20)
+    try:
+        datos = resp.json()
+    except ValueError:
+        datos = {}
+    if resp.status_code >= 400:
+        errores = datos.get("errors") or [{}]
+        mensaje = errores[0].get("message", f"HTTP {resp.status_code}")
+        raise DerivError(f"{metodo} {ruta}: {mensaje}")
+    return datos
+
+
+def elegir_cuenta(cuentas: list) -> dict | None:
+    tipo = "real" if MODO_REAL else "demo"
+    for cuenta in cuentas:
+        if cuenta.get("account_type") == tipo and cuenta.get("status", "active") == "active":
+            return cuenta
+    return None
+
+
+async def obtener_url_ws() -> tuple[str, dict]:
+    datos = await asyncio.to_thread(_rest, "GET", "/trading/v1/options/accounts")
+    cuenta = elegir_cuenta(datos.get("data", []))
+    if cuenta is None:
+        if MODO_REAL:
+            raise DerivError("no hay cuenta real de Options; créala en Deriv antes de activar MODO_REAL")
+        creada = await asyncio.to_thread(
+            _rest, "POST", "/trading/v1/options/accounts",
+            {"currency": "USD", "group": "row", "account_type": "demo"},
+        )
+        datos_cuenta = creada["data"]
+        cuenta = datos_cuenta[0] if isinstance(datos_cuenta, list) else datos_cuenta
+    otp = await asyncio.to_thread(
+        _rest, "POST", f"/trading/v1/options/accounts/{cuenta['account_id']}/otp"
+    )
+    return otp["data"]["url"], cuenta
 
 
 class DerivClient:
-    def __init__(self, token: str, url: str) -> None:
-        self.token = token
-        self.url = url
+    def __init__(self) -> None:
         self.ws = None
-        self.info: dict = {}
+        self.cuenta: dict = {}
         self.listo = asyncio.Event()
         self._pendientes: dict[int, asyncio.Future] = {}
         self._req = 0
@@ -149,16 +188,18 @@ class DerivClient:
         espera = 2
         while True:
             try:
-                async with websockets.connect(url, additional_headers=CABECERAS_WS, ping_interval=20, ping_timeout=20) as ws:
+                url, cuenta = await obtener_url_ws()
+                self.cuenta = cuenta
+                async with websockets.connect(
+                    url,
+                    additional_headers=CABECERAS_WS,
+                    ping_interval=20,
+                    ping_timeout=20,
+                ) as ws:
                     self.ws = ws
-                    await ws.send(json.dumps({"authorize": self.token}))
-                    resp = json.loads(await ws.recv())
-                    if "error" in resp:
-                        raise DerivError(resp["error"].get("message", "token inválido"))
-                    self.info = resp["authorize"]
                     self.listo.set()
                     espera = 2
-                    log.info("Deriv conectado: %s", self.info.get("loginid"))
+                    log.info("Deriv conectado: cuenta %s (%s)", cuenta.get("account_id"), cuenta.get("account_type"))
                     async for raw in ws:
                         msg = json.loads(raw)
                         fut = self._pendientes.get(msg.get("req_id"))
@@ -191,6 +232,7 @@ class Lectura:
     atr: float
     ema_macro: float
     vol_inst: bool
+    abierto: bool
 
 
 def proxy_volumen(precios: list, tiempos: list) -> pd.Series:
@@ -220,13 +262,12 @@ def calcular_indicadores(velas: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-async def obtener_pip() -> tuple[float, int]:
+async def info_simbolo() -> dict:
     respuesta = await DERIV.request({"active_symbols": "brief"})
     for simbolo in respuesta.get("active_symbols", []):
-        if simbolo.get("symbol") == SYMBOL:
-            pip = float(simbolo.get("pip", 0.00001))
-            return pip, max(0, int(round(-math.log10(pip))))
-    return 0.00001, 5
+        if simbolo.get("underlying_symbol") == SYMBOL:
+            return simbolo
+    raise DerivError(f"el símbolo {SYMBOL} no está disponible en esta cuenta")
 
 
 def redondear(precio: float) -> float:
@@ -235,8 +276,10 @@ def redondear(precio: float) -> float:
 
 async def leer_mercado() -> Lectura | None:
     global PIP, DECIMALES
-    if PIP is None:
-        PIP, DECIMALES = await obtener_pip()
+    info = await info_simbolo()
+    PIP = float(info.get("pip_size", 0.00001))
+    DECIMALES = max(0, int(round(-math.log10(PIP))))
+    abierto = int(info.get("exchange_is_open", 0)) == 1 and int(info.get("is_trading_suspended", 0)) == 0
 
     velas_r, ticks_r = await asyncio.gather(
         DERIV.request({"ticks_history": SYMBOL, "style": "candles",
@@ -271,6 +314,7 @@ async def leer_mercado() -> Lectura | None:
         atr=float(cerrada["atr"]),
         ema_macro=float(cerrada["ema_macro"]),
         vol_inst=bool(cerrada["vol_inst"]),
+        abierto=abierto,
     )
 
 
@@ -288,18 +332,18 @@ class Plan:
 def planificar(direccion: int, entrada: float, atr: float) -> tuple[Plan | None, str]:
     if not atr or atr <= 0:
         return None, "ATR no válido"
-    dist_min = SL_ATR_MULT * atr
-    cota = RIESGO_MAX_USD * entrada / (STAKE * dist_min)
+    perdida_bruta = RIESGO_USD - COMISION_USD
+    ganancia_bruta = BENEFICIO_USD + COMISION_USD
+    cota = perdida_bruta * entrada / (STAKE * SL_ATR_MULT * atr)
     candidatos = [m for m in MULTIPLICADORES if m <= cota]
     if not candidatos:
-        return None, (f"con ${RIESGO_MAX_USD:.2f} de riesgo el SL quedaría dentro "
-                      f"del ruido (menos de {SL_ATR_MULT} ATR)")
+        return None, f"el stop de ${RIESGO_USD:.2f} quedaría dentro del ruido (menos de {SL_ATR_MULT} ATR)"
     multiplicador = max(candidatos)
-    dist_sl = RIESGO_MAX_USD * entrada / (STAKE * multiplicador)
-    dist_tp = RATIO_RR * dist_sl
-    riesgo = dist_sl * STAKE * multiplicador / entrada
-    beneficio = dist_tp * STAKE * multiplicador / entrada
-    if riesgo > RIESGO_MAX_USD + 1e-9 or beneficio < BENEFICIO_MIN_USD - 1e-9:
+    dist_sl = perdida_bruta * entrada / (STAKE * multiplicador)
+    dist_tp = ganancia_bruta * entrada / (STAKE * multiplicador)
+    riesgo = dist_sl * STAKE * multiplicador / entrada + COMISION_USD
+    beneficio = dist_tp * STAKE * multiplicador / entrada - COMISION_USD
+    if riesgo > RIESGO_USD + 1e-9 or beneficio < BENEFICIO_USD - 1e-9:
         return None, "no cumple el filtro de riesgo y beneficio"
     plan = Plan(
         direccion=direccion,
@@ -317,11 +361,11 @@ def fmt(precio: float) -> str:
     return f"{precio:.7f}".rstrip("0").rstrip(".")
 
 
-def texto_alerta(plan: Plan) -> str:
-    tendencia = "alcista" if plan.direccion > 0 else "bajista"
-    operacion = "compra" if plan.direccion > 0 else "venta"
-    return (f"la tendencia es '{tendencia}' cuanto quieres ganar {fmt(plan.tp)} "
-            f"y cuanto es el stop lose {fmt(plan.sl)}; entré en {operacion}")
+def texto_alerta(direccion: int, tp: float, sl: float) -> str:
+    tendencia = "alcista" if direccion > 0 else "bajista"
+    operacion = "compra" if direccion > 0 else "venta"
+    return (f"la tendencia es '{tendencia}' cuanto quieres ganar {fmt(tp)} "
+            f"y cuanto es el stop lose {fmt(sl)}; entré en {operacion}")
 
 
 class Estado:
@@ -337,11 +381,11 @@ ESTADO = Estado()
 
 
 def verificar_modo() -> None:
-    if DERIV is None or not DERIV.info:
+    if DERIV is None or not DERIV.cuenta:
         raise RuntimeError("sin conexión con Deriv")
-    es_demo = bool(DERIV.info.get("is_virtual"))
-    if (not es_demo) != MODO_REAL:
-        raise RuntimeError("el token no coincide con MODO_REAL; con MODO_REAL=false solo se opera en demo")
+    es_real = DERIV.cuenta.get("account_type") == "real"
+    if es_real != MODO_REAL:
+        raise RuntimeError("la cuenta conectada no coincide con MODO_REAL")
 
 
 async def abrir_operacion(plan: Plan, bot) -> int:
@@ -357,17 +401,22 @@ async def abrir_operacion(plan: Plan, bot) -> int:
             "basis": "stake",
             "contract_type": tipo,
             "currency": "USD",
-            "symbol": SYMBOL,
+            "underlying_symbol": SYMBOL,
             "multiplier": plan.multiplicador,
             "limit_order": {
-                "stop_loss": round(RIESGO_MAX_USD, 2),
-                "take_profit": round(BENEFICIO_MIN_USD, 2),
+                "stop_loss": RIESGO_USD,
+                "take_profit": BENEFICIO_USD,
             },
         }))["proposal"]
-        compra = (await DERIV.request({"buy": propuesta["id"],
-                                       "price": propuesta["ask_price"]}))["buy"]
+        niveles = propuesta.get("limit_order", {})
+        tp = float(niveles["take_profit"]["value"]) if "take_profit" in niveles else plan.tp
+        sl = float(niveles["stop_loss"]["value"]) if "stop_loss" in niveles else plan.sl
+        compra = (await DERIV.request({
+            "buy": propuesta["id"],
+            "price": float(propuesta["ask_price"]),
+        }))["buy"]
         contrato = int(compra["contract_id"])
-    await bot.send_message(chat_id=CHAT_ID, text=texto_alerta(plan))
+    await bot.send_message(chat_id=CHAT_ID, text=texto_alerta(plan.direccion, tp, sl))
     tarea = asyncio.create_task(vigilar_contrato(contrato, bot))
     ESTADO.vigilancias.add(tarea)
     tarea.add_done_callback(ESTADO.vigilancias.discard)
@@ -378,8 +427,7 @@ async def vigilar_contrato(contrato: int, bot) -> None:
     while True:
         await asyncio.sleep(5)
         try:
-            respuesta = await DERIV.request({"proposal_open_contract": 1,
-                                             "contract_id": contrato})
+            respuesta = await DERIV.request({"proposal_open_contract": 1, "contract_id": contrato})
         except Exception as e:
             log.warning("No pude consultar el contrato %s: %s", contrato, e)
             continue
@@ -402,14 +450,12 @@ async def resumen_resultados(desde: int | None) -> tuple[int, float]:
         payload["date_from"] = desde
     respuesta = await DERIV.request(payload)
     transacciones = respuesta["profit_table"].get("transactions", [])
-    ganancia = sum(float(t.get("sell_price", 0)) - float(t.get("buy_price", 0))
-                   for t in transacciones)
+    ganancia = sum(float(t.get("sell_price", 0)) - float(t.get("buy_price", 0)) for t in transacciones)
     return len(transacciones), ganancia
 
 
 async def texto_ganancias() -> str:
-    inicio_dia = int(datetime.now(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0).timestamp())
+    inicio_dia = int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     n_hoy, g_hoy = await resumen_resultados(inicio_dia)
     n_total, g_total = await resumen_resultados(None)
     saldo = (await DERIV.request({"balance": 1}))["balance"]
@@ -423,7 +469,7 @@ async def texto_ganancias() -> str:
 
 async def ciclo_automatico(bot) -> None:
     lectura = await leer_mercado()
-    if lectura is None or lectura.epoch == ESTADO.ultima_vela:
+    if lectura is None or not lectura.abierto or lectura.epoch == ESTADO.ultima_vela:
         return
     ESTADO.ultima_vela = lectura.epoch
     if not lectura.vol_inst:
@@ -466,15 +512,14 @@ def solo_dueno(func):
 
 def texto_menu() -> str:
     cuenta = "sin conexión"
-    if DERIV is not None and DERIV.info:
-        tipo = "DEMO" if DERIV.info.get("is_virtual") else "REAL"
-        cuenta = f"{DERIV.info.get('loginid')} ({tipo})"
+    if DERIV is not None and DERIV.cuenta:
+        cuenta = f"{DERIV.cuenta.get('account_id')} ({DERIV.cuenta.get('account_type')})"
     automatico = "ACTIVO" if ESTADO.auto_activo else "apagado"
     return (
         f"Bot {SYMBOL}\n"
         f"Cuenta: {cuenta}\n"
         f"Modo automático: {automatico}\n"
-        f"Stake ${STAKE:.2f} · riesgo ${RIESGO_MAX_USD:.2f} · beneficio ${BENEFICIO_MIN_USD:.2f}"
+        f"Stake ${STAKE:.2f} · riesgo ${RIESGO_USD:.2f} · beneficio ${BENEFICIO_USD:.2f}"
     )
 
 
@@ -505,8 +550,9 @@ async def editar(q, texto: str, markup=None) -> None:
 def texto_lectura(lectura: Lectura, planes: dict[int, Plan], motivos: dict[int, str]) -> str:
     hora = datetime.fromtimestamp(lectura.epoch, timezone.utc).strftime("%H:%M UTC")
     tendencia = "alcista" if lectura.cierre > lectura.ema_macro else "bajista"
+    estado_mercado = "abierto" if lectura.abierto else "cerrado"
     lineas = [
-        f"{SYMBOL} · vela cerrada {hora}",
+        f"{SYMBOL} · vela cerrada {hora} · mercado {estado_mercado}",
         f"Tendencia (cierre vs EMA 200): {tendencia}",
         f"Z-Score (20): {lectura.z:+.2f}",
         f"ATR (14): {lectura.atr:.5f}",
@@ -517,7 +563,7 @@ def texto_lectura(lectura: Lectura, planes: dict[int, Plan], motivos: dict[int, 
         if direccion in planes:
             p = planes[direccion]
             lineas.append(
-                f"{nombre}: SL {fmt(p.sl)} · TP {fmt(p.tp)} · multiplicador x{p.multiplicador} · "
+                f"{nombre}: SL {fmt(p.sl)} · TP {fmt(p.tp)} · x{p.multiplicador} · "
                 f"riesgo ${p.riesgo_usd:.2f} · beneficio ${p.beneficio_usd:.2f}"
             )
         else:
@@ -533,12 +579,15 @@ async def mostrar_menu_manual(q) -> None:
         return
     planes: dict[int, Plan] = {}
     motivos: dict[int, str] = {}
-    for direccion in (1, -1):
-        plan, motivo = planificar(direccion, lectura.precio_vivo, lectura.atr)
-        if plan is None:
-            motivos[direccion] = motivo
-        else:
-            planes[direccion] = plan
+    if not lectura.abierto:
+        motivos = {1: "mercado cerrado", -1: "mercado cerrado"}
+    else:
+        for direccion in (1, -1):
+            plan, motivo = planificar(direccion, lectura.precio_vivo, lectura.atr)
+            if plan is None:
+                motivos[direccion] = motivo
+            else:
+                planes[direccion] = plan
     botones = []
     if 1 in planes:
         botones.append(InlineKeyboardButton(f"Comprar ${STAKE:.2f}", callback_data="ejecutar:1"))
@@ -554,6 +603,9 @@ async def ejecutar_manual(q, direccion: int, bot) -> None:
     lectura = await leer_mercado()
     if lectura is None:
         raise RuntimeError("datos insuficientes para recalcular")
+    if not lectura.abierto:
+        await editar(q, "El mercado está cerrado; no se envió la orden.", boton_volver())
+        return
     plan, motivo = planificar(direccion, lectura.precio_vivo, lectura.atr)
     if plan is None:
         await editar(q, f"Señal descartada al confirmar: {motivo}", boton_volver())
@@ -605,11 +657,11 @@ async def on_boton(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_init(app: Application) -> None:
     global DERIV
     ESTADO.lock = asyncio.Lock()
-    DERIV = DerivClient(DERIV_TOKEN, DERIV_URL)
+    DERIV = DerivClient()
     DERIV.iniciar()
     ESTADO.tareas.append(asyncio.create_task(keep_alive(RENDER_URL)))
     ESTADO.tareas.append(asyncio.create_task(bucle_automatico(app.bot)))
-    log.info("Servicio iniciado. Keep-alive cada %d s hacia %s", INTERVALO_KEEPALIVE, RENDER_URL)
+    log.info("Servicio iniciado. Símbolo %s, keep-alive hacia %s", SYMBOL, RENDER_URL)
 
 
 async def on_shutdown(app: Application) -> None:
