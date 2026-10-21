@@ -281,30 +281,14 @@ async def leer_mercado() -> Lectura | None:
     DECIMALES = max(0, int(round(-math.log10(PIP))))
     abierto = int(info.get("exchange_is_open", 0)) == 1 and int(info.get("is_trading_suspended", 0)) == 0
 
-    velas_r, ticks_r = await asyncio.gather(
-        DERIV.request({"ticks_history": SYMBOL, "style": "candles",
-                       "granularity": GRANULARIDAD, "count": VELAS, "end": "latest"}),
-        DERIV.request({"ticks_history": SYMBOL, "style": "ticks",
-                       "count": TICKS, "end": "latest"}),
-    )
-    velas = pd.DataFrame(velas_r.get("candles", []))
+    respuesta = await DERIV.request({"ticks_history": SYMBOL, "style": "candles",
+                                     "granularity": GRANULARIDAD, "count": VELAS, "end": "latest"})
+    velas = pd.DataFrame(respuesta.get("candles", []))
     if len(velas) < EMA_MACRO + 5:
         raise DerivError(f"Deriv devolvió {len(velas)} velas y necesito al menos {EMA_MACRO + 5}")
     for columna in ("open", "high", "low", "close"):
         velas[columna] = velas[columna].astype(float)
-
-    historial = ticks_r.get("history", {})
-    precios = [float(p) for p in historial.get("prices", [])]
-    tiempos = [int(t) for t in historial.get("times", [])]
-    if len(precios) < 2:
-        raise DerivError(f"Deriv devolvió {len(precios)} ticks")
-
-    inicio_ventana = int(velas["epoch"].iloc[-(VOL_LEN + 1)])
-    if min(tiempos) > inicio_ventana:
-        raise DerivError("el historial de ticks no cubre las últimas velas; pide más ticks o espera")
-
-    proxy = proxy_volumen(precios, tiempos)
-    velas["vol_proxy"] = velas["epoch"].map(proxy).fillna(0.0).astype(float)
+    velas["vol_proxy"] = (velas["high"] - velas["low"]).astype(float)
 
     indicadores = calcular_indicadores(velas)
     cerrada = indicadores.iloc[-2]
@@ -313,7 +297,7 @@ async def leer_mercado() -> Lectura | None:
     return Lectura(
         epoch=int(cerrada["epoch"]),
         cierre=float(cerrada["close"]),
-        precio_vivo=precios[-1],
+        precio_vivo=float(velas["close"].iloc[-1]),
         z=float(cerrada["z"]),
         atr=float(cerrada["atr"]),
         ema_macro=float(cerrada["ema_macro"]),
