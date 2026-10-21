@@ -297,14 +297,14 @@ async def leer_mercado() -> Lectura | None:
     precios = [float(p) for p in historial.get("prices", [])]
     tiempos = [int(t) for t in historial.get("times", [])]
     if len(precios) < 2:
-        raise DerivError(f"Deriv devolvió {len(precios)} ticks; sin ticks no hay volumen")
+        raise DerivError(f"Deriv devolvió {len(precios)} ticks")
+
+    inicio_ventana = int(velas["epoch"].iloc[-(VOL_LEN + 1)])
+    if min(tiempos) > inicio_ventana:
+        raise DerivError("el historial de ticks no cubre las últimas velas; pide más ticks o espera")
+
     proxy = proxy_volumen(precios, tiempos)
     velas["vol_proxy"] = velas["epoch"].map(proxy).fillna(0.0).astype(float)
-
-    ventana = velas["epoch"].iloc[-(VOL_LEN + 1):-1]
-    faltantes = int((~ventana.isin(proxy.index)).sum())
-    if faltantes:
-        raise DerivError(f"faltan ticks en {faltantes} de las últimas {VOL_LEN} velas")
 
     indicadores = calcular_indicadores(velas)
     cerrada = indicadores.iloc[-2]
