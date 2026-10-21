@@ -287,25 +287,29 @@ async def leer_mercado() -> Lectura | None:
         DERIV.request({"ticks_history": SYMBOL, "style": "ticks",
                        "count": TICKS, "end": "latest"}),
     )
-    velas = pd.DataFrame(velas_r["candles"])
+    velas = pd.DataFrame(velas_r.get("candles", []))
     if len(velas) < EMA_MACRO + 5:
-        return None
+        raise DerivError(f"Deriv devolvió {len(velas)} velas y necesito al menos {EMA_MACRO + 5}")
     for columna in ("open", "high", "low", "close"):
         velas[columna] = velas[columna].astype(float)
 
-    precios = [float(p) for p in ticks_r["history"]["prices"]]
-    tiempos = [int(t) for t in ticks_r["history"]["times"]]
+    historial = ticks_r.get("history", {})
+    precios = [float(p) for p in historial.get("prices", [])]
+    tiempos = [int(t) for t in historial.get("times", [])]
+    if len(precios) < 2:
+        raise DerivError(f"Deriv devolvió {len(precios)} ticks; sin ticks no hay volumen")
     proxy = proxy_volumen(precios, tiempos)
     velas["vol_proxy"] = velas["epoch"].map(proxy).fillna(0.0).astype(float)
 
     ventana = velas["epoch"].iloc[-(VOL_LEN + 1):-1]
-    if not ventana.isin(proxy.index).all():
-        return None
+    faltantes = int((~ventana.isin(proxy.index)).sum())
+    if faltantes:
+        raise DerivError(f"faltan ticks en {faltantes} de las últimas {VOL_LEN} velas")
 
     indicadores = calcular_indicadores(velas)
     cerrada = indicadores.iloc[-2]
     if pd.isna(cerrada["z"]) or pd.isna(cerrada["atr"]):
-        return None
+        raise DerivError("los indicadores aún no tienen suficientes datos")
     return Lectura(
         epoch=int(cerrada["epoch"]),
         cierre=float(cerrada["close"]),
