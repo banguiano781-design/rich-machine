@@ -34,7 +34,7 @@ DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "").strip()
 MODO_REAL = os.environ.get("MODO_REAL", "false").strip().lower() == "true"
 
 SYMBOL = os.environ.get("DERIV_SYMBOL", "frxXAUUSD").strip()
-MULTIPLICADORES = sorted({int(x) for x in os.environ.get("MULTIPLICADORES", "50").split(",") if x.strip()})
+MULTIPLICADORES = sorted({int(x) for x in os.environ.get("MULTIPLICADORES", "100,200,300,500,800").split(",") if x.strip()})
 STAKE = float(os.environ.get("STAKE", "1.00"))
 RIESGO_USD = float(os.environ.get("RIESGO_USD", "0.10"))
 BENEFICIO_USD = float(os.environ.get("BENEFICIO_USD", "0.40"))
