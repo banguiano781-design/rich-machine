@@ -426,6 +426,7 @@ class Estado:
         self.perdidas_seguidas: int = 0
         self.gate: dict | None = None
         self.gate_hora: float = 0.0
+        self.bot = None
         self.lock: asyncio.Lock | None = None
         self.tareas: list[asyncio.Task] = []
         self.vigilancias: set[asyncio.Task] = set()
@@ -574,14 +575,55 @@ async def preparar_df_backtest() -> pd.DataFrame:
     return calcular_indicadores(velas)
 
 
+def gate_apto() -> bool:
+    return bool(ESTADO.gate and ESTADO.gate["apto"])
+
+
+def texto_cambio_gate(gate: dict) -> str:
+    if gate["apto"]:
+        return (
+            "🟢 La señal ahora es APTA según el backtest.\n"
+            f"Señal: {MODO_SENAL} · operaciones resueltas: {gate['decididas']}\n"
+            f"Acierto: {gate['p']:.1%} (cota inferior {gate['p_bajo']:.1%})\n"
+            f"Valor esperado con cota inferior: ${gate['ev_bajo']:+.3f} por operación.\n"
+            "Esto no garantiza ganancias. Los modos manual y automático siguen apagados hasta que tú los actives."
+        )
+    return (
+        "🔴 La señal dejó de ser apta.\n"
+        f"Motivo: {gate['motivo']}.\n"
+        "El modo manual vuelve a bloquearse."
+    )
+
+
+async def registrar_gate(gate: dict) -> None:
+    previo = gate_apto()
+    gate["hora"] = time.time()
+    ESTADO.gate = gate
+    ESTADO.gate_hora = gate["hora"]
+    log.info("Ventaja (%s): %s", MODO_SENAL, gate["motivo"])
+    if gate["apto"] != previo and ESTADO.bot is not None:
+        try:
+            await ESTADO.bot.send_message(chat_id=CHAT_ID, text=texto_cambio_gate(gate))
+        except Exception as e:
+            log.warning("No pude enviar el aviso de ventaja: %s", e)
+
+
 async def actualizar_gate() -> dict:
     df = await preparar_df_backtest()
     resultados = await asyncio.to_thread(simular_variante, df, MODO_SENAL)
     gate = fundamentos.evaluar(resultados, RIESGO_USD, BENEFICIO_USD, MIN_SENALES)
-    ESTADO.gate = gate
-    ESTADO.gate_hora = time.time()
-    log.info("Gate de ventaja (%s): %s", MODO_SENAL, gate["motivo"])
+    await registrar_gate(gate)
     return gate
+
+
+async def bucle_gate() -> None:
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await actualizar_gate()
+        except Exception:
+            log.exception("Error al actualizar la ventaja")
+        await asyncio.sleep(GATE_HORAS * 3600)
 
 
 def bloque_variante(nombre: str, ev: dict) -> str:
@@ -612,8 +654,7 @@ async def texto_backtest() -> str:
     ev_momentum = fundamentos.evaluar(res_momentum, RIESGO_USD, BENEFICIO_USD, MIN_SENALES)
     ev_reversion = fundamentos.evaluar(res_reversion, RIESGO_USD, BENEFICIO_USD, MIN_SENALES)
     ev_activo = ev_momentum if MODO_SENAL == "momentum" else ev_reversion
-    ESTADO.gate = ev_activo
-    ESTADO.gate_hora = time.time()
+    await registrar_gate(dict(ev_activo))
 
     ruina_sin_ventaja = fundamentos.riesgo_de_ruina(p_teorico, BENEFICIO_USD, RIESGO_USD, CAPITAL_CUENTA)
     lineas_ruina = [
@@ -634,6 +675,7 @@ async def texto_backtest() -> str:
     veredicto = "APTO para automático" if ev_activo["apto"] else f"NO APTO para automático: {ev_activo['motivo']}"
     return "\n".join([
         f"Backtest · {len(df)} velas de 1 min · {primera} a {ultima} UTC",
+        f"Calculado a las {datetime.now(timezone.utc):%H:%M} UTC · se recalcula cada {GATE_HORAS:g} h",
         f"Equilibrio: el acierto debe superar {equilibrio:.0%}",
         "",
         f"1) Paseo aleatorio (sin ventaja): acierto teórico {p_teorico:.1%}, simulado {p_simulado:.1%}",
@@ -679,8 +721,6 @@ async def bucle_automatico(bot) -> None:
     while True:
         if ESTADO.auto_activo:
             try:
-                if ESTADO.gate is None or time.time() - ESTADO.gate_hora > GATE_HORAS * 3600:
-                    await actualizar_gate()
                 await ciclo_automatico(bot)
             except Exception:
                 log.exception("Error en el ciclo automático")
@@ -707,7 +747,7 @@ def texto_menu() -> str:
     elif ESTADO.gate["apto"]:
         ventaja = "demostrada"
     else:
-        ventaja = "no demostrada (automático bloqueado)"
+        ventaja = "no demostrada (manual y automático bloqueados)"
     return (
         f"Bot {SYMBOL}\n"
         f"Cuenta: {cuenta}\n"
@@ -766,7 +806,28 @@ def texto_lectura(lectura: Lectura, planes: dict[int, Plan], motivos: dict[int, 
     return "\n".join(lineas)
 
 
+def texto_manual_bloqueado() -> str:
+    if ESTADO.gate is None:
+        return "Modo manual bloqueado: todavía no hay medición de la ventaja. Toca Backtest y espera el resultado."
+    return (
+        "Modo manual bloqueado: la ventaja no está demostrada.\n"
+        f"Motivo: {ESTADO.gate['motivo']}.\n"
+        f"Última medición: {datetime.fromtimestamp(ESTADO.gate_hora, timezone.utc):%d/%m %H:%M} UTC.\n"
+        "Te avisaré aquí cuando el backtest sea APTO."
+    )
+
+
+def teclado_bloqueado() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Backtest", callback_data="backtest")],
+        [InlineKeyboardButton("Menú", callback_data="menu")],
+    ])
+
+
 async def mostrar_menu_manual(q) -> None:
+    if not gate_apto():
+        await editar(q, texto_manual_bloqueado(), teclado_bloqueado())
+        return
     await editar(q, "Analizando el mercado...")
     lectura = await leer_mercado()
     if lectura is None:
@@ -794,6 +855,9 @@ async def mostrar_menu_manual(q) -> None:
 
 
 async def ejecutar_manual(q, direccion: int, bot) -> None:
+    if not gate_apto():
+        await editar(q, texto_manual_bloqueado(), teclado_bloqueado())
+        return
     await editar(q, "Recalculando la señal y enviando la orden...")
     lectura = await leer_mercado()
     if lectura is None:
@@ -869,7 +933,9 @@ async def on_init(app: Application) -> None:
     DERIV = DerivClient()
     DERIV.iniciar()
     ESTADO.tareas.append(asyncio.create_task(keep_alive(RENDER_URL)))
+    ESTADO.bot = app.bot
     ESTADO.tareas.append(asyncio.create_task(bucle_automatico(app.bot)))
+    ESTADO.tareas.append(asyncio.create_task(bucle_gate()))
     log.info("Servicio iniciado. Símbolo %s, señal %s, keep-alive hacia %s", SYMBOL, MODO_SENAL, RENDER_URL)
 
 
