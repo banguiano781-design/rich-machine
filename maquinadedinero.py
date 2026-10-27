@@ -1,4 +1,4 @@
-"""maquinadedinero.py: bot híbrido para Deriv (API nueva, con OTP) con Modo Manual y Modo Automático, controlado desde Telegram y desplegado como Web Service gratuito en Render."""
+"""maquinadedinero.py: bot híbrido para Deriv (API nueva, con OTP) con Modo Manual, Modo Automático, backtest estadístico y control de riesgo, controlado desde Telegram y desplegado como Web Service gratuito en Render."""
 from __future__ import annotations
 
 import asyncio
@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -19,6 +20,8 @@ from flask import Flask
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+
+import fundamentos
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -39,6 +42,13 @@ STAKE = float(os.environ.get("STAKE", "1.00"))
 RIESGO_USD = float(os.environ.get("RIESGO_USD", "0.10"))
 BENEFICIO_USD = float(os.environ.get("BENEFICIO_USD", "0.40"))
 COMISION_USD = float(os.environ.get("COMISION_USD", "0.02"))
+CAPITAL_CUENTA = float(os.environ.get("CAPITAL_CUENTA", "5.00"))
+MODO_SENAL = os.environ.get("MODO_SENAL", "momentum").strip().lower()
+MIN_SENALES = int(os.environ.get("MIN_SENALES", "100"))
+GATE_HORAS = float(os.environ.get("GATE_HORAS", "1"))
+MAX_PERDIDAS_SEGUIDAS = int(os.environ.get("MAX_PERDIDAS_SEGUIDAS", "3"))
+LIMITE_PERDIDA_DIA = float(os.environ.get("LIMITE_PERDIDA_DIA", "0.30"))
+COOLDOWN_AUTO_MIN = float(os.environ.get("COOLDOWN_AUTO_MIN", "15"))
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://rich-machine-1.onrender.com").strip()
 PORT = int(os.environ.get("PORT", "5000"))
 
@@ -51,7 +61,8 @@ VOL_MULT = 2.5
 Z_EXTREMO = 2.5
 GRANULARIDAD = 60
 VELAS = 300
-TICKS = 5000
+VELAS_BACKTEST = 5000
+HORIZONTE_BACKTEST = 60
 INTERVALO_KEEPALIVE = 600
 INTERVALO_AUTO = 20
 CABECERAS_WS = {
@@ -76,6 +87,8 @@ def validar_configuracion() -> None:
         raise SystemExit("Faltan variables de entorno: " + ", ".join(faltantes))
     if RIESGO_USD <= COMISION_USD:
         raise SystemExit("RIESGO_USD debe ser mayor que COMISION_USD")
+    if MODO_SENAL not in ("momentum", "reversion"):
+        raise SystemExit("MODO_SENAL debe ser 'momentum' o 'reversion'")
 
 
 flask_app = Flask(__name__)
@@ -219,7 +232,7 @@ class DerivClient:
 
 
 DERIV: DerivClient | None = None
-PIP: float | None = None
+PIP: float = 0.00001
 DECIMALES = 5
 
 
@@ -233,14 +246,6 @@ class Lectura:
     ema_macro: float
     vol_inst: bool
     abierto: bool
-
-
-def proxy_volumen(precios: list, tiempos: list) -> pd.Series:
-    p = pd.Series(precios, dtype="float64")
-    t = pd.Series(tiempos, dtype="int64")
-    movimiento = p.diff().abs().fillna(0.0)
-    bucket = (t // GRANULARIDAD) * GRANULARIDAD
-    return movimiento.groupby(bucket.to_numpy()).sum()
 
 
 def calcular_indicadores(velas: pd.DataFrame) -> pd.DataFrame:
@@ -270,15 +275,19 @@ async def info_simbolo() -> dict:
     raise DerivError(f"el símbolo {SYMBOL} no está disponible en esta cuenta")
 
 
+def fijar_pip(info: dict) -> None:
+    global PIP, DECIMALES
+    PIP = float(info.get("pip_size", 0.00001))
+    DECIMALES = max(0, int(round(-math.log10(PIP))))
+
+
 def redondear(precio: float) -> float:
     return round(round(precio / PIP) * PIP, DECIMALES)
 
 
 async def leer_mercado() -> Lectura | None:
-    global PIP, DECIMALES
     info = await info_simbolo()
-    PIP = float(info.get("pip_size", 0.00001))
-    DECIMALES = max(0, int(round(-math.log10(PIP))))
+    fijar_pip(info)
     abierto = int(info.get("exchange_is_open", 0)) == 1 and int(info.get("is_trading_suspended", 0)) == 0
 
     respuesta = await DERIV.request({"ticks_history": SYMBOL, "style": "candles",
@@ -306,6 +315,24 @@ async def leer_mercado() -> Lectura | None:
     )
 
 
+def senal_de(z: float, cierre: float, ema: float, vol_inst: bool, modo: str) -> int | None:
+    if not vol_inst:
+        return None
+    if z >= Z_EXTREMO:
+        extremo = 1
+    elif z <= -Z_EXTREMO:
+        extremo = -1
+    else:
+        return None
+    if modo == "reversion":
+        return -extremo
+    if extremo == 1 and cierre > ema:
+        return 1
+    if extremo == -1 and cierre < ema:
+        return -1
+    return None
+
+
 @dataclass
 class Plan:
     direccion: int
@@ -315,22 +342,23 @@ class Plan:
     tp: float
     riesgo_usd: float
     beneficio_usd: float
+    stake: float
 
 
-def planificar(direccion: int, entrada: float, atr: float) -> tuple[Plan | None, str]:
+def planificar(direccion: int, entrada: float, atr: float, stake: float = STAKE) -> tuple[Plan | None, str]:
     if not atr or atr <= 0:
         return None, "ATR no válido"
     perdida_bruta = RIESGO_USD - COMISION_USD
     ganancia_bruta = BENEFICIO_USD + COMISION_USD
-    cota = perdida_bruta * entrada / (STAKE * SL_ATR_MULT * atr)
+    cota = perdida_bruta * entrada / (stake * SL_ATR_MULT * atr)
     candidatos = [m for m in MULTIPLICADORES if m <= cota]
     if not candidatos:
         return None, f"el stop de ${RIESGO_USD:.2f} quedaría dentro del ruido (menos de {SL_ATR_MULT} ATR)"
     multiplicador = max(candidatos)
-    dist_sl = perdida_bruta * entrada / (STAKE * multiplicador)
-    dist_tp = ganancia_bruta * entrada / (STAKE * multiplicador)
-    riesgo = dist_sl * STAKE * multiplicador / entrada + COMISION_USD
-    beneficio = dist_tp * STAKE * multiplicador / entrada - COMISION_USD
+    dist_sl = perdida_bruta * entrada / (stake * multiplicador)
+    dist_tp = ganancia_bruta * entrada / (stake * multiplicador)
+    riesgo = dist_sl * stake * multiplicador / entrada + COMISION_USD
+    beneficio = dist_tp * stake * multiplicador / entrada - COMISION_USD
     if riesgo > RIESGO_USD + 1e-9 or beneficio < BENEFICIO_USD - 1e-9:
         return None, "no cumple el filtro de riesgo y beneficio"
     plan = Plan(
@@ -341,8 +369,69 @@ def planificar(direccion: int, entrada: float, atr: float) -> tuple[Plan | None,
         tp=redondear(entrada + direccion * dist_tp),
         riesgo_usd=riesgo,
         beneficio_usd=beneficio,
+        stake=stake,
     )
     return plan, ""
+
+
+def _resolver(df: pd.DataFrame, desde: int, plan: Plan) -> tuple[str, int]:
+    hasta = min(desde + HORIZONTE_BACKTEST, len(df))
+    for j in range(desde, hasta):
+        alto = float(df["high"].iloc[j])
+        bajo = float(df["low"].iloc[j])
+        if plan.direccion > 0:
+            if bajo <= plan.sl:
+                return "perdida", j
+            if alto >= plan.tp:
+                return "ganada", j
+        else:
+            if alto >= plan.sl:
+                return "perdida", j
+            if bajo <= plan.tp:
+                return "ganada", j
+    return "expirada", hasta - 1
+
+
+def simular_variante(df: pd.DataFrame, modo: str) -> list[str]:
+    resultados: list[str] = []
+    i = EMA_MACRO + ZLEN
+    fin = len(df) - HORIZONTE_BACKTEST - 1
+    while i < fin:
+        fila = df.iloc[i]
+        if pd.isna(fila["z"]) or pd.isna(fila["atr"]):
+            i += 1
+            continue
+        direccion = senal_de(float(fila["z"]), float(fila["close"]),
+                             float(fila["ema_macro"]), bool(fila["vol_inst"]), modo)
+        if direccion is None:
+            i += 1
+            continue
+        plan, _ = planificar(direccion, float(fila["close"]), float(fila["atr"]))
+        if plan is None:
+            i += 1
+            continue
+        resultado, salida = _resolver(df, i + 1, plan)
+        resultados.append(resultado)
+        i = salida + 1
+    return resultados
+
+
+class Estado:
+    def __init__(self) -> None:
+        self.auto_activo = False
+        self.ultima_vela: int | None = None
+        self.ultima_auto: float = 0.0
+        self.dia: str | None = None
+        self.pnl_dia: float = 0.0
+        self.perdidas_seguidas: int = 0
+        self.gate: dict | None = None
+        self.gate_hora: float = 0.0
+        self.lock: asyncio.Lock | None = None
+        self.tareas: list[asyncio.Task] = []
+        self.vigilancias: set[asyncio.Task] = set()
+
+
+ESTADO = Estado()
 
 
 def fmt(precio: float) -> str:
@@ -356,18 +445,6 @@ def texto_alerta(direccion: int, tp: float, sl: float) -> str:
             f"y cuanto es el stop lose {fmt(sl)}; entré en {operacion}")
 
 
-class Estado:
-    def __init__(self) -> None:
-        self.auto_activo = False
-        self.ultima_vela: int | None = None
-        self.lock: asyncio.Lock | None = None
-        self.tareas: list[asyncio.Task] = []
-        self.vigilancias: set[asyncio.Task] = set()
-
-
-ESTADO = Estado()
-
-
 def verificar_modo() -> None:
     if DERIV is None or not DERIV.cuenta:
         raise RuntimeError("sin conexión con Deriv")
@@ -376,7 +453,24 @@ def verificar_modo() -> None:
         raise RuntimeError("la cuenta conectada no coincide con MODO_REAL")
 
 
-async def abrir_operacion(plan: Plan, bot) -> int:
+def registrar_resultado(resultado: float, automatica: bool) -> str | None:
+    hoy = datetime.now(timezone.utc).date().isoformat()
+    if ESTADO.dia != hoy:
+        ESTADO.dia = hoy
+        ESTADO.pnl_dia = 0.0
+    ESTADO.pnl_dia += resultado
+    ESTADO.perdidas_seguidas = ESTADO.perdidas_seguidas + 1 if resultado < 0 else 0
+    if automatica and ESTADO.auto_activo:
+        if ESTADO.perdidas_seguidas >= MAX_PERDIDAS_SEGUIDAS:
+            ESTADO.auto_activo = False
+            return f"Modo automático DETENIDO: {ESTADO.perdidas_seguidas} pérdidas seguidas."
+        if ESTADO.pnl_dia <= -LIMITE_PERDIDA_DIA:
+            ESTADO.auto_activo = False
+            return f"Modo automático DETENIDO: pérdida del día ${ESTADO.pnl_dia:.2f}."
+    return None
+
+
+async def abrir_operacion(plan: Plan, bot, automatica: bool = False) -> int:
     async with ESTADO.lock:
         verificar_modo()
         abiertas = await DERIV.request({"portfolio": 1})
@@ -385,7 +479,7 @@ async def abrir_operacion(plan: Plan, bot) -> int:
         tipo = "MULTUP" if plan.direccion > 0 else "MULTDOWN"
         propuesta = (await DERIV.request({
             "proposal": 1,
-            "amount": STAKE,
+            "amount": plan.stake,
             "basis": "stake",
             "contract_type": tipo,
             "currency": "USD",
@@ -405,13 +499,13 @@ async def abrir_operacion(plan: Plan, bot) -> int:
         }))["buy"]
         contrato = int(compra["contract_id"])
     await bot.send_message(chat_id=CHAT_ID, text=texto_alerta(plan.direccion, tp, sl))
-    tarea = asyncio.create_task(vigilar_contrato(contrato, bot))
+    tarea = asyncio.create_task(vigilar_contrato(contrato, bot, automatica))
     ESTADO.vigilancias.add(tarea)
     tarea.add_done_callback(ESTADO.vigilancias.discard)
     return contrato
 
 
-async def vigilar_contrato(contrato: int, bot) -> None:
+async def vigilar_contrato(contrato: int, bot, automatica: bool) -> None:
     while True:
         await asyncio.sleep(5)
         try:
@@ -422,58 +516,161 @@ async def vigilar_contrato(contrato: int, bot) -> None:
         estado_contrato = respuesta["proposal_open_contract"]
         if estado_contrato.get("is_sold"):
             resultado = float(estado_contrato.get("profit", 0.0))
+            avisos = [f"Contrato {contrato} cerrado. Resultado: ${resultado:+.2f}"]
+            aviso_riesgo = registrar_resultado(resultado, automatica)
+            if aviso_riesgo:
+                avisos.append(aviso_riesgo)
             try:
-                await bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=f"Contrato {contrato} cerrado. Resultado: ${resultado:+.2f}",
-                )
+                await bot.send_message(chat_id=CHAT_ID, text="\n".join(avisos))
             except Exception as e:
                 log.warning("No pude notificar el cierre: %s", e)
             return
 
 
-async def resumen_resultados(desde: int | None) -> tuple[int, float]:
+async def resumen_resultados(desde: int | None) -> tuple[int, float, int, int]:
     payload = {"profit_table": 1, "description": 1, "sort": "DESC", "limit": 100}
     if desde is not None:
         payload["date_from"] = desde
     respuesta = await DERIV.request(payload)
     transacciones = respuesta["profit_table"].get("transactions", [])
-    ganancia = sum(float(t.get("sell_price", 0)) - float(t.get("buy_price", 0)) for t in transacciones)
-    return len(transacciones), ganancia
+    ganancia = 0.0
+    ganadas = 0
+    perdidas = 0
+    for t in transacciones:
+        neto = float(t.get("sell_price", 0)) - float(t.get("buy_price", 0))
+        ganancia += neto
+        if neto > 0:
+            ganadas += 1
+        elif neto < 0:
+            perdidas += 1
+    return len(transacciones), ganancia, ganadas, perdidas
 
 
 async def texto_ganancias() -> str:
     inicio_dia = int(datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    n_hoy, g_hoy = await resumen_resultados(inicio_dia)
-    n_total, g_total = await resumen_resultados(None)
+    n_hoy, g_hoy, w_hoy, l_hoy = await resumen_resultados(inicio_dia)
+    n_tot, g_tot, w_tot, l_tot = await resumen_resultados(None)
+    tasa = w_tot / (w_tot + l_tot) if (w_tot + l_tot) else 0.0
     saldo = (await DERIV.request({"balance": 1}))["balance"]
     return (
         "Ganancias (cuenta Deriv)\n"
-        f"Hoy: ${g_hoy:+.2f} en {n_hoy} operaciones\n"
-        f"Últimas {n_total} operaciones: ${g_total:+.2f}\n"
+        f"Hoy: ${g_hoy:+.2f} · {w_hoy} ganadas, {l_hoy} perdidas\n"
+        f"Últimas {n_tot} operaciones: ${g_tot:+.2f} · acierto {tasa:.0%}\n"
         f"Saldo actual: ${float(saldo['balance']):.2f} {saldo.get('currency', 'USD')}"
     )
 
 
+async def preparar_df_backtest() -> pd.DataFrame:
+    info = await info_simbolo()
+    fijar_pip(info)
+    respuesta = await DERIV.request({"ticks_history": SYMBOL, "style": "candles",
+                                     "granularity": GRANULARIDAD, "count": VELAS_BACKTEST, "end": "latest"})
+    velas = pd.DataFrame(respuesta.get("candles", []))
+    if len(velas) < EMA_MACRO + ZLEN + HORIZONTE_BACKTEST + 10:
+        raise DerivError(f"solo llegaron {len(velas)} velas")
+    for columna in ("open", "high", "low", "close"):
+        velas[columna] = velas[columna].astype(float)
+    velas["vol_proxy"] = (velas["high"] - velas["low"]).astype(float)
+    return calcular_indicadores(velas)
+
+
+async def actualizar_gate() -> dict:
+    df = await preparar_df_backtest()
+    resultados = await asyncio.to_thread(simular_variante, df, MODO_SENAL)
+    gate = fundamentos.evaluar(resultados, RIESGO_USD, BENEFICIO_USD, MIN_SENALES)
+    ESTADO.gate = gate
+    ESTADO.gate_hora = time.time()
+    log.info("Gate de ventaja (%s): %s", MODO_SENAL, gate["motivo"])
+    return gate
+
+
+def bloque_variante(nombre: str, ev: dict) -> str:
+    if ev["decididas"] == 0:
+        return f"{nombre}: sin operaciones resueltas"
+    return (
+        f"{nombre}: {ev['n']} señales (ganadas {ev['ganadas']}, perdidas {ev['perdidas']}, expiradas {ev['expiradas']})\n"
+        f"   acierto {ev['p']:.1%} · IC 95% [{ev['p_bajo']:.1%}, {ev['p_alto']:.1%}]\n"
+        f"   valor esperado ${ev['ev']:+.3f} · cota inferior ${ev['ev_bajo']:+.3f}\n"
+        f"   Kelly con cota inferior: {ev['kelly']:.1%} del capital"
+    )
+
+
+async def texto_backtest() -> str:
+    df = await preparar_df_backtest()
+    riesgo_bruto = RIESGO_USD - COMISION_USD
+    beneficio_bruto = BENEFICIO_USD + COMISION_USD
+    p_teorico = fundamentos.paseo_aleatorio_teorico(riesgo_bruto, beneficio_bruto)
+    multiplicador = MULTIPLICADORES[0]
+    cierres = df["close"].to_numpy(dtype=float)
+    sigma_min = float(np.std(np.diff(np.log(cierres)), ddof=1))
+    p_simulado = await asyncio.to_thread(
+        fundamentos.paseo_aleatorio_gbm, sigma_min,
+        riesgo_bruto / (STAKE * multiplicador), beneficio_bruto / (STAKE * multiplicador),
+    )
+    res_momentum = await asyncio.to_thread(simular_variante, df, "momentum")
+    res_reversion = await asyncio.to_thread(simular_variante, df, "reversion")
+    ev_momentum = fundamentos.evaluar(res_momentum, RIESGO_USD, BENEFICIO_USD, MIN_SENALES)
+    ev_reversion = fundamentos.evaluar(res_reversion, RIESGO_USD, BENEFICIO_USD, MIN_SENALES)
+    ev_activo = ev_momentum if MODO_SENAL == "momentum" else ev_reversion
+    ESTADO.gate = ev_activo
+    ESTADO.gate_hora = time.time()
+
+    ruina_sin_ventaja = fundamentos.riesgo_de_ruina(p_teorico, BENEFICIO_USD, RIESGO_USD, CAPITAL_CUENTA)
+    lineas_ruina = [
+        f"4) Ruina en 100 operaciones con ${CAPITAL_CUENTA:.2f}:",
+        f"   sin ventaja (acierto {p_teorico:.1%}): quiebra {ruina_sin_ventaja['quiebra']:.0%}, "
+        f"pierde la mitad {ruina_sin_ventaja['pierde_mitad']:.0%}",
+    ]
+    if ev_activo["decididas"] > 0:
+        ruina_observada = fundamentos.riesgo_de_ruina(ev_activo["p"], BENEFICIO_USD, RIESGO_USD, CAPITAL_CUENTA)
+        lineas_ruina.append(
+            f"   con el acierto observado ({ev_activo['p']:.1%}): quiebra {ruina_observada['quiebra']:.0%}, "
+            f"pierde la mitad {ruina_observada['pierde_mitad']:.0%}"
+        )
+    ind = fundamentos.independencia(cierres)
+    primera = datetime.fromtimestamp(int(df["epoch"].iloc[0]), timezone.utc).strftime("%d/%m %H:%M")
+    ultima = datetime.fromtimestamp(int(df["epoch"].iloc[-1]), timezone.utc).strftime("%d/%m %H:%M")
+    equilibrio = RIESGO_USD / (RIESGO_USD + BENEFICIO_USD)
+    veredicto = "APTO para automático" if ev_activo["apto"] else f"NO APTO para automático: {ev_activo['motivo']}"
+    return "\n".join([
+        f"Backtest · {len(df)} velas de 1 min · {primera} a {ultima} UTC",
+        f"Equilibrio: el acierto debe superar {equilibrio:.0%}",
+        "",
+        f"1) Paseo aleatorio (sin ventaja): acierto teórico {p_teorico:.1%}, simulado {p_simulado:.1%}",
+        f"   valor esperado ${-COMISION_USD:+.3f} por operación, igual a la comisión",
+        "",
+        "2) " + bloque_variante("Momentum (actual)", ev_momentum),
+        "",
+        "3) " + bloque_variante("Reversión", ev_reversion),
+        "",
+        *lineas_ruina,
+        "",
+        f"5) Independencia: P(sube | subió antes) {ind['p_sube_tras_sube']:.1%} · "
+        f"P(sube | bajó antes) {ind['p_sube_tras_baja']:.1%} · z {ind['z']:+.2f}",
+        "",
+        f"Veredicto ({MODO_SENAL}): {veredicto}",
+    ])
+
+
 async def ciclo_automatico(bot) -> None:
+    if ESTADO.gate is None or not ESTADO.gate["apto"]:
+        return
+    if time.time() - ESTADO.ultima_auto < COOLDOWN_AUTO_MIN * 60:
+        return
     lectura = await leer_mercado()
     if lectura is None or not lectura.abierto or lectura.epoch == ESTADO.ultima_vela:
         return
     ESTADO.ultima_vela = lectura.epoch
-    if not lectura.vol_inst:
-        return
-    if lectura.z >= Z_EXTREMO and lectura.cierre > lectura.ema_macro:
-        direccion = 1
-    elif lectura.z <= -Z_EXTREMO and lectura.cierre < lectura.ema_macro:
-        direccion = -1
-    else:
+    direccion = senal_de(lectura.z, lectura.cierre, lectura.ema_macro, lectura.vol_inst, MODO_SENAL)
+    if direccion is None:
         return
     plan, motivo = planificar(direccion, lectura.precio_vivo, lectura.atr)
     if plan is None:
         log.info("Señal automática descartada: %s", motivo)
         return
     try:
-        await abrir_operacion(plan, bot)
+        await abrir_operacion(plan, bot, automatica=True)
+        ESTADO.ultima_auto = time.time()
     except Exception as e:
         log.warning("Orden automática no enviada: %s", e)
 
@@ -482,6 +679,8 @@ async def bucle_automatico(bot) -> None:
     while True:
         if ESTADO.auto_activo:
             try:
+                if ESTADO.gate is None or time.time() - ESTADO.gate_hora > GATE_HORAS * 3600:
+                    await actualizar_gate()
                 await ciclo_automatico(bot)
             except Exception:
                 log.exception("Error en el ciclo automático")
@@ -503,10 +702,17 @@ def texto_menu() -> str:
     if DERIV is not None and DERIV.cuenta:
         cuenta = f"{DERIV.cuenta.get('account_id')} ({DERIV.cuenta.get('account_type')})"
     automatico = "ACTIVO" if ESTADO.auto_activo else "apagado"
+    if ESTADO.gate is None:
+        ventaja = "sin medir (usa Backtest)"
+    elif ESTADO.gate["apto"]:
+        ventaja = "demostrada"
+    else:
+        ventaja = "no demostrada (automático bloqueado)"
     return (
         f"Bot {SYMBOL}\n"
         f"Cuenta: {cuenta}\n"
-        f"Modo automático: {automatico}\n"
+        f"Modo automático: {automatico} (señal: {MODO_SENAL})\n"
+        f"Ventaja de la señal: {ventaja}\n"
         f"Stake ${STAKE:.2f} · riesgo ${RIESGO_USD:.2f} · beneficio ${BENEFICIO_USD:.2f}"
     )
 
@@ -520,6 +726,7 @@ def teclado_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Modo Manual", callback_data="manual")],
         [boton_auto],
         [InlineKeyboardButton("Ganancias", callback_data="ganancias")],
+        [InlineKeyboardButton("Backtest", callback_data="backtest")],
     ])
 
 
@@ -618,6 +825,17 @@ async def cmd_ganancias(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 @solo_dueno
+async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    mensaje = await update.message.reply_text("Calculando backtest... puede tardar unos segundos.")
+    try:
+        texto = await texto_backtest()
+    except Exception as e:
+        log.exception("Error en /backtest")
+        texto = f"No pude calcular el backtest: {e}"
+    await mensaje.edit_text(texto)
+
+
+@solo_dueno
 async def on_boton(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     consulta = update.callback_query
     await consulta.answer()
@@ -637,6 +855,9 @@ async def on_boton(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await editar(consulta, texto_menu(), teclado_menu())
         elif dato == "ganancias":
             await editar(consulta, await texto_ganancias(), boton_volver())
+        elif dato == "backtest":
+            await editar(consulta, "Calculando backtest... puede tardar unos segundos.")
+            await editar(consulta, await texto_backtest(), boton_volver())
     except Exception as e:
         log.exception("Error en el botón %s", dato)
         await editar(consulta, f"Error: {e}", boton_volver())
@@ -649,7 +870,7 @@ async def on_init(app: Application) -> None:
     DERIV.iniciar()
     ESTADO.tareas.append(asyncio.create_task(keep_alive(RENDER_URL)))
     ESTADO.tareas.append(asyncio.create_task(bucle_automatico(app.bot)))
-    log.info("Servicio iniciado. Símbolo %s, keep-alive hacia %s", SYMBOL, RENDER_URL)
+    log.info("Servicio iniciado. Símbolo %s, señal %s, keep-alive hacia %s", SYMBOL, MODO_SENAL, RENDER_URL)
 
 
 async def on_shutdown(app: Application) -> None:
@@ -671,6 +892,7 @@ def main() -> None:
     )
     aplicacion.add_handler(CommandHandler("start", cmd_start))
     aplicacion.add_handler(CommandHandler("ganancias", cmd_ganancias))
+    aplicacion.add_handler(CommandHandler("backtest", cmd_backtest))
     aplicacion.add_handler(CallbackQueryHandler(on_boton))
     aplicacion.run_polling(drop_pending_updates=True)
 
