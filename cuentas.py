@@ -5,8 +5,8 @@ Te pide el token personal (PAT) y el App ID; no se guardan en ningún lado.
 """
 import requests
 
-pat = input("Pega tu token personal (PAT): ").strip()
-app_id = input("Pega tu App ID nuevo: ").strip()
+pat = input("34NyWlqHxJwOQCwnvtpEy").strip()
+app_id = input("pat_d96e873df295bd4448f919f083b4efc8a467b6c741679a2336b2894257c6c461 ").strip()
 
 resp = requests.get(
     "https://api.derivws.com/trading/v1/options/accounts",
