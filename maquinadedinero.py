@@ -61,7 +61,7 @@ INTERVALO_KEEPALIVE = 600
 INTERVALO_AUTO = 20
 
 DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089").strip()
-DERIV_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+DERIV_URL = f"wss://red.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 flask_app = Flask(__name__)
 
