@@ -1,9 +1,4 @@
-"""Bot híbrido Deriv + Telegram para microcuenta en Render.
-
-Conexión a Deriv:
-- Si defines DERIV_PAT y DERIV_ACCOUNT_ID usa la API NUEVA (token personal + OTP).
-- Si no, sigue usando la API antigua con DERIV_TOKEN.
-"""
+"""Bot híbrido Deriv + Telegram para microcuenta en Render."""
 from __future__ import annotations
 
 import asyncio
@@ -12,13 +7,10 @@ import json
 import logging
 import math
 import os
-import random
-import re
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
@@ -31,25 +23,13 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("bot_hibrido")
-# Evita que el token de Telegram aparezca en los logs (httpx imprime la URL completa).
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = int(os.environ.get("TELEGRAM_CHAT_ID", "0").strip() or "0")
-
-# API antigua
 DERIV_TOKEN = os.environ.get("DERIV_TOKEN", "").strip()
-# API nueva
-DERIV_PAT = os.environ.get("DERIV_PAT", "").strip()
-DERIV_ACCOUNT_ID = os.environ.get("DERIV_ACCOUNT_ID", "").strip()
-USAR_NUEVA_API = bool(DERIV_PAT and DERIV_ACCOUNT_ID)
 
-if not TELEGRAM_TOKEN or not CHAT_ID or not (DERIV_TOKEN or USAR_NUEVA_API):
-    raise SystemExit(
-        "Faltan TELEGRAM_TOKEN, TELEGRAM_CHAT_ID o las credenciales de Deriv "
-        "(DERIV_TOKEN, o bien DERIV_PAT + DERIV_ACCOUNT_ID)."
-    )
+if not TELEGRAM_TOKEN or not CHAT_ID or not DERIV_TOKEN:
+    raise SystemExit("Faltan TELEGRAM_TOKEN, TELEGRAM_CHAT_ID o DERIV_TOKEN.")
 
 SYMBOL = os.environ.get("DERIV_SYMBOL", "frxXAUUSD").strip()
 MODO_REAL = os.environ.get("MODO_REAL", "false").strip().lower() == "true"
@@ -82,16 +62,6 @@ INTERVALO_AUTO = 20
 
 DERIV_APP_ID = os.environ.get("DERIV_APP_ID", "1089").strip()
 DERIV_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
-DERIV_REST = "https://api.derivws.com"
-
-if USAR_NUEVA_API and DERIV_APP_ID == "1089":
-    raise SystemExit(
-        "Con la API nueva necesitas un DERIV_APP_ID propio, registrado en developers.deriv.com. "
-        "El 1089 (antiguo) no funciona con la API nueva."
-    )
-
-# En la API nueva el campo "symbol" se llama "underlying_symbol".
-CLAVE_SIMBOLO = "underlying_symbol" if USAR_NUEVA_API else "symbol"
 
 flask_app = Flask(__name__)
 
@@ -121,43 +91,6 @@ async def keep_alive(url: str) -> None:
 
 class DerivError(Exception):
     pass
-
-
-def detalle_rechazo(exc: Exception) -> str:
-    """Si el servidor rechazó la conexión, devuelve datos útiles de su respuesta (sin secretos)."""
-    resp = getattr(exc, "response", None)
-    cabeceras = getattr(resp, "headers", None) or getattr(exc, "headers", None)
-    partes = []
-    if cabeceras is not None:
-        for clave in ("server", "cf-ray"):
-            try:
-                valor = cabeceras.get(clave)
-            except Exception:
-                valor = None
-            if valor:
-                partes.append(f"{clave}={valor}")
-    cuerpo = getattr(resp, "body", None)
-    if cuerpo:
-        crudo = cuerpo[:3000].decode("utf-8", "replace") if isinstance(cuerpo, (bytes, bytearray)) else str(cuerpo)[:3000]
-        texto = " ".join(re.sub(r"<[^>]+>", " ", crudo).split())
-        if texto:
-            partes.append("cuerpo=" + texto[:160])
-    return (" | " + "; ".join(partes)) if partes else ""
-
-
-def pedir_url_otp() -> str:
-    """API nueva: pide por REST una URL de WebSocket ya autenticada (OTP)."""
-    resp = requests.post(
-        f"{DERIV_REST}/trading/v1/options/accounts/{DERIV_ACCOUNT_ID}/otp",
-        headers={"Authorization": f"Bearer {DERIV_PAT}", "Deriv-App-ID": DERIV_APP_ID},
-        timeout=20,
-    )
-    if resp.status_code != 200:
-        raise DerivError(f"OTP rechazado (HTTP {resp.status_code}): {resp.text[:300]}")
-    try:
-        return resp.json()["data"]["url"]
-    except (KeyError, ValueError, TypeError) as exc:
-        raise DerivError(f"Respuesta de OTP inesperada: {resp.text[:300]}") from exc
 
 
 class DerivClient:
@@ -196,42 +129,32 @@ class DerivClient:
             raise DerivError(msg["error"].get("message", "error de Deriv"))
         return msg
 
-    async def _ping_aplicacion(self, ws) -> None:
-        try:
-            while True:
-                await asyncio.sleep(30)
-                await ws.send(json.dumps({"ping": 1}))
-        except Exception:
-            return
-
     async def _mantener(self) -> None:
         espera = 2
         while True:
-            ping_tarea = None
-            url = None
             try:
-                if USAR_NUEVA_API:
-                    # Un OTP nuevo en cada intento de conexión.
-                    url = await asyncio.to_thread(pedir_url_otp)
-                else:
-                    url = self.url
-                async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                cabeceras = {
+                    "Origin": "https://deriv.com",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                }
+                opciones = {"ping_interval": 20, "ping_timeout": 20, "open_timeout": 20}
+                try:
+                    conexion = websockets.connect(self.url, additional_headers=cabeceras, **opciones)
+                except TypeError:
+                    conexion = websockets.connect(self.url, extra_headers=cabeceras, **opciones)
+                async with conexion as ws:
                     self.ws = ws
-                    if USAR_NUEVA_API:
-                        # La URL del OTP ya viene autenticada: no hay mensaje "authorize".
-                        self.info = {
-                            "loginid": DERIV_ACCOUNT_ID,
-                            "is_virtual": 1 if "/ws/demo" in url else 0,
-                        }
-                    else:
-                        await ws.send(json.dumps({"authorize": self.token}))
-                        resp = json.loads(await ws.recv())
-                        if "error" in resp:
-                            raise DerivError(resp["error"].get("message", "token inválido"))
-                        self.info = resp["authorize"]
+                    await ws.send(json.dumps({"authorize": self.token}))
+                    resp = json.loads(await ws.recv())
+                    if "error" in resp:
+                        raise DerivError(resp["error"].get("message", "token inválido"))
+                    self.info = resp["authorize"]
                     self.listo.set()
                     espera = 2
-                    ping_tarea = asyncio.create_task(self._ping_aplicacion(ws))
                     log.info("Deriv conectado: %s", self.info.get("loginid"))
                     async for raw in ws:
                         msg = json.loads(raw)
@@ -241,24 +164,15 @@ class DerivClient:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                destino = urlparse(url).netloc if url else "paso OTP (REST)"
-                log.warning(
-                    "Conexión con Deriv perdida [API %s -> %s]: %s%s",
-                    "NUEVA" if USAR_NUEVA_API else "antigua",
-                    destino,
-                    exc,
-                    detalle_rechazo(exc),
-                )
+                log.warning("Conexión con Deriv perdida: %s", exc)
             finally:
-                if ping_tarea:
-                    ping_tarea.cancel()
                 self.ws = None
                 self.listo.clear()
                 for fut in self._pendientes.values():
                     if not fut.done():
                         fut.set_exception(ConnectionError("conexión con Deriv perdida"))
                 self._pendientes.clear()
-            await asyncio.sleep(espera + random.random())
+            await asyncio.sleep(espera)
             espera = min(espera * 2, 60)
 
 
@@ -313,10 +227,8 @@ def calcular_indicadores(velas: pd.DataFrame) -> pd.DataFrame:
 async def obtener_pip() -> tuple[float, int]:
     respuesta = await DERIV.request({"active_symbols": "brief"})
     for simbolo in respuesta.get("active_symbols", []):
-        # API nueva: underlying_symbol / pip_size. API antigua: symbol / pip.
-        nombre = simbolo.get("underlying_symbol") or simbolo.get("symbol")
-        if nombre == SYMBOL:
-            pip = float(simbolo.get("pip_size") or simbolo.get("pip") or 0.00001)
+        if simbolo.get("symbol") == SYMBOL:
+            pip = float(simbolo.get("pip", 0.00001) or 0.00001)
             return pip, max(0, int(round(-math.log10(pip))))
     return 0.00001, 5
 
@@ -410,8 +322,7 @@ def atr_cerrado(df: pd.DataFrame) -> float:
 
 
 async def multiplicadores_del_simbolo() -> list[int]:
-    # La API nueva ya no acepta "currency" en contracts_for.
-    respuesta = await DERIV.request({"contracts_for": SYMBOL})
+    respuesta = await DERIV.request({"contracts_for": SYMBOL, "currency": "USD"})
     hallados: set[int] = set()
     for contrato in respuesta.get("contracts_for", {}).get("available", []):
         if contrato.get("contract_type") not in ("MULTUP", "MULTDOWN"):
@@ -536,7 +447,7 @@ async def abrir_operacion(plan: Plan, bot) -> str:
                     "basis": "stake",
                     "contract_type": tipo,
                     "currency": "USD",
-                    CLAVE_SIMBOLO: SYMBOL,
+                    "symbol": SYMBOL,
                     "multiplier": plan.multiplicador,
                     "limit_order": {
                         "stop_loss": plan.riesgo_usd,
@@ -545,10 +456,7 @@ async def abrir_operacion(plan: Plan, bot) -> str:
                 }
             )
         )["proposal"]
-        # En la API nueva ask_price puede llegar como texto.
-        compra = (
-            await DERIV.request({"buy": propuesta["id"], "price": float(propuesta["ask_price"])})
-        )["buy"]
+        compra = (await DERIV.request({"buy": propuesta["id"], "price": propuesta["ask_price"]}))["buy"]
         contrato = str(compra["contract_id"])
     await bot.send_message(chat_id=CHAT_ID, text=texto_alerta(plan))
     tarea = asyncio.create_task(vigilar_contrato(contrato, bot))
@@ -893,19 +801,7 @@ async def on_init(app: Application) -> None:
     ESTADO.tareas.append(asyncio.create_task(cargar_multiplicadores()))
     ESTADO.tareas.append(asyncio.create_task(keep_alive(RENDER_URL)))
     ESTADO.tareas.append(asyncio.create_task(bucle_automatico(app.bot)))
-    log.info(
-        "Credenciales Deriv -> DERIV_TOKEN:%s DERIV_PAT:%s DERIV_ACCOUNT_ID:%s DERIV_APP_ID:%s",
-        "si" if DERIV_TOKEN else "no",
-        "si" if DERIV_PAT else "no",
-        "si" if DERIV_ACCOUNT_ID else "no",
-        DERIV_APP_ID,
-    )
-    log.info(
-        "Servicio iniciado (API %s). Keep-alive cada %ss hacia %s",
-        "NUEVA" if USAR_NUEVA_API else "antigua",
-        INTERVALO_KEEPALIVE,
-        RENDER_URL,
-    )
+    log.info("Servicio iniciado. Keep-alive cada %ss hacia %s", INTERVALO_KEEPALIVE, RENDER_URL)
 
 
 async def on_shutdown(app: Application) -> None:
