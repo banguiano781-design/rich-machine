@@ -1,4 +1,4 @@
- ""Bot híbrido Deriv + Telegram para microcuenta en Render.""
+"""Bot híbrido Deriv + Telegram para microcuenta en Render."""
 from __future__ import annotations
 
 import asyncio
