@@ -13,10 +13,12 @@ import logging
 import math
 import os
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
@@ -121,6 +123,28 @@ class DerivError(Exception):
     pass
 
 
+def detalle_rechazo(exc: Exception) -> str:
+    """Si el servidor rechazó la conexión, devuelve datos útiles de su respuesta (sin secretos)."""
+    resp = getattr(exc, "response", None)
+    cabeceras = getattr(resp, "headers", None) or getattr(exc, "headers", None)
+    partes = []
+    if cabeceras is not None:
+        for clave in ("server", "cf-ray"):
+            try:
+                valor = cabeceras.get(clave)
+            except Exception:
+                valor = None
+            if valor:
+                partes.append(f"{clave}={valor}")
+    cuerpo = getattr(resp, "body", None)
+    if cuerpo:
+        crudo = cuerpo[:3000].decode("utf-8", "replace") if isinstance(cuerpo, (bytes, bytearray)) else str(cuerpo)[:3000]
+        texto = " ".join(re.sub(r"<[^>]+>", " ", crudo).split())
+        if texto:
+            partes.append("cuerpo=" + texto[:160])
+    return (" | " + "; ".join(partes)) if partes else ""
+
+
 def pedir_url_otp() -> str:
     """API nueva: pide por REST una URL de WebSocket ya autenticada (OTP)."""
     resp = requests.post(
@@ -184,6 +208,7 @@ class DerivClient:
         espera = 2
         while True:
             ping_tarea = None
+            url = None
             try:
                 if USAR_NUEVA_API:
                     # Un OTP nuevo en cada intento de conexión.
@@ -216,7 +241,14 @@ class DerivClient:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.warning("Conexión con Deriv perdida: %s", exc)
+                destino = urlparse(url).netloc if url else "paso OTP (REST)"
+                log.warning(
+                    "Conexión con Deriv perdida [API %s -> %s]: %s%s",
+                    "NUEVA" if USAR_NUEVA_API else "antigua",
+                    destino,
+                    exc,
+                    detalle_rechazo(exc),
+                )
             finally:
                 if ping_tarea:
                     ping_tarea.cancel()
@@ -861,6 +893,13 @@ async def on_init(app: Application) -> None:
     ESTADO.tareas.append(asyncio.create_task(cargar_multiplicadores()))
     ESTADO.tareas.append(asyncio.create_task(keep_alive(RENDER_URL)))
     ESTADO.tareas.append(asyncio.create_task(bucle_automatico(app.bot)))
+    log.info(
+        "Credenciales Deriv -> DERIV_TOKEN:%s DERIV_PAT:%s DERIV_ACCOUNT_ID:%s DERIV_APP_ID:%s",
+        "si" if DERIV_TOKEN else "no",
+        "si" if DERIV_PAT else "no",
+        "si" if DERIV_ACCOUNT_ID else "no",
+        DERIV_APP_ID,
+    )
     log.info(
         "Servicio iniciado (API %s). Keep-alive cada %ss hacia %s",
         "NUEVA" if USAR_NUEVA_API else "antigua",
