@@ -53,8 +53,9 @@ DERIV_TOKEN = os.environ.get("DERIV_TOKEN", "").strip()
 DERIV_PAT = _leer_env("DERIV_PAT")
 DERIV_ACCOUNT_ID = _leer_env("DERIV_ACCOUNT_ID")
 USAR_NUEVA_API = bool(DERIV_PAT and DERIV_ACCOUNT_ID) and _leer_env("DERIV_API", "nueva").lower() != "antigua"
+MODO_DESCUBRIR = bool(DERIV_PAT) and not DERIV_ACCOUNT_ID
 
-if not TELEGRAM_TOKEN or not CHAT_ID or not (DERIV_TOKEN or USAR_NUEVA_API):
+if not TELEGRAM_TOKEN or not CHAT_ID or not (DERIV_TOKEN or USAR_NUEVA_API or MODO_DESCUBRIR):
     raise SystemExit(
         "Faltan TELEGRAM_TOKEN, TELEGRAM_CHAT_ID o las credenciales de Deriv "
         "(DERIV_TOKEN, o bien DERIV_PAT + DERIV_ACCOUNT_ID)."
@@ -116,9 +117,14 @@ except (TypeError, ValueError):
 CLAVE_CABECERAS = "additional_headers" if "additional_headers" in _params_ws else "extra_headers"
 
 if USAR_NUEVA_API and DERIV_APP_ID == "1089":
+    _definida = "DERIV_APP_ID" in os.environ
+    _parecidas = sorted(k for k in os.environ if "DERIV" in k.upper() or "APP_ID" in k.upper())
     raise SystemExit(
-        "Con la API nueva necesitas un DERIV_APP_ID propio, registrado en developers.deriv.com. "
-        "El 1089 (antiguo) no funciona con la API nueva."
+        "DERIV_APP_ID no sirve para la API nueva: "
+        + ("la variable existe pero vale 1089 (o está vacía)." if _definida else "la variable NO está definida con ese nombre exacto.")
+        + " Pon el App ID propio (el de 21 caracteres de developers.deriv.com), con el nombre exacto DERIV_APP_ID, "
+        "sin espacios ni comillas. "
+        f"Variables con nombre parecido que veo en Render: {_parecidas}"
     )
 
 # En la API nueva el campo "symbol" se llama "underlying_symbol".
@@ -176,6 +182,55 @@ def detalle_rechazo(exc: Exception) -> str:
     return (" | " + "; ".join(partes)) if partes else ""
 
 
+def listar_cuentas() -> str:
+    """Pide por REST tus cuentas de la API nueva (para copiar el ID de la demo)."""
+    resp = requests.get(
+        f"{DERIV_REST}/trading/v1/options/accounts",
+        headers={"Authorization": f"Bearer {DERIV_PAT}", "Deriv-App-ID": DERIV_APP_ID},
+        timeout=20,
+    )
+    cuerpo = " ".join(resp.text.split())[:1500]
+    return f"HTTP {resp.status_code}: {cuerpo}"
+
+
+async def descubrir_cuentas() -> None:
+    """Modo ayuda: falta DERIV_ACCOUNT_ID. Escribe en el log tus cuentas y la respuesta de Deriv."""
+    while True:
+        try:
+            if DERIV_APP_ID == "1089":
+                log.error("[DESCUBRIR] Falta DERIV_APP_ID: el 1089 es de la API antigua. Pon el App ID nuevo.")
+            else:
+                log.info(
+                    "[DESCUBRIR] Token: %s car. (empieza con pat_: %s) | App ID: %s car.",
+                    len(DERIV_PAT),
+                    "si" if DERIV_PAT.startswith("pat_") else "NO",
+                    len(DERIV_APP_ID),
+                )
+                texto = await asyncio.to_thread(listar_cuentas)
+                log.info("[DESCUBRIR] Respuesta de Deriv -> %s", texto)
+                log.info("[DESCUBRIR] Si salió HTTP 200, copia el ID de la cuenta DEMO a DERIV_ACCOUNT_ID en Render.")
+        except Exception as exc:
+            log.warning("[DESCUBRIR] Error: %s", exc)
+        await asyncio.sleep(120)
+
+
+def _buscar_wss(obj):
+    """Busca la primera cadena que empiece con wss:// dentro de una respuesta JSON."""
+    if isinstance(obj, str):
+        return obj if obj.startswith("wss://") else None
+    if isinstance(obj, dict):
+        for valor in obj.values():
+            hallado = _buscar_wss(valor)
+            if hallado:
+                return hallado
+    if isinstance(obj, list):
+        for valor in obj:
+            hallado = _buscar_wss(valor)
+            if hallado:
+                return hallado
+    return None
+
+
 def pedir_url_otp() -> str:
     """API nueva: pide por REST una URL de WebSocket ya autenticada (OTP)."""
     resp = requests.post(
@@ -194,9 +249,31 @@ def pedir_url_otp() -> str:
         pista = f" -> {pista}" if pista else ""
         raise DerivError(f"OTP rechazado (HTTP {resp.status_code}){pista}: {resp.text[:300]}")
     try:
-        return resp.json()["data"]["url"]
-    except (KeyError, ValueError, TypeError) as exc:
-        raise DerivError(f"Respuesta de OTP inesperada: {resp.text[:300]}") from exc
+        datos = resp.json()
+    except ValueError as exc:
+        raise DerivError("La respuesta del OTP no es JSON") from exc
+    url = _buscar_wss(datos)
+    if not url:
+        campos = list(datos)[:10] if isinstance(datos, dict) else type(datos).__name__
+        raise DerivError(f"Respuesta de OTP sin URL de WebSocket (campos: {campos})")
+    return url
+
+
+def es_cuenta_demo(url_ws: str) -> bool:
+    """API nueva: consulta si DERIV_ACCOUNT_ID es demo o real; si falla, lo deduce de la URL."""
+    try:
+        resp = requests.get(
+            f"{DERIV_REST}/trading/v1/options/accounts",
+            headers={"Authorization": f"Bearer {DERIV_PAT}", "Deriv-App-ID": DERIV_APP_ID},
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            for cuenta in resp.json().get("data", []):
+                if cuenta.get("account_id") == DERIV_ACCOUNT_ID:
+                    return cuenta.get("account_type") == "demo"
+    except Exception as exc:
+        log.warning("No pude consultar el tipo de cuenta: %s", exc)
+    return "/ws/demo" in url_ws
 
 
 class DerivClient:
@@ -264,9 +341,10 @@ class DerivClient:
                     self.ws = ws
                     if USAR_NUEVA_API:
                         # La URL del OTP ya viene autenticada: no hay mensaje "authorize".
+                        es_demo = await asyncio.to_thread(es_cuenta_demo, url)
                         self.info = {
                             "loginid": DERIV_ACCOUNT_ID,
-                            "is_virtual": 1 if "/ws/demo" in url else 0,
+                            "is_virtual": 1 if es_demo else 0,
                         }
                     else:
                         await ws.send(json.dumps({"authorize": self.token}))
@@ -933,6 +1011,11 @@ async def cargar_multiplicadores() -> None:
 async def on_init(app: Application) -> None:
     global DERIV
     ESTADO.lock = asyncio.Lock()
+    if MODO_DESCUBRIR:
+        log.info("MODO DESCUBRIR: hay token pero falta DERIV_ACCOUNT_ID. Busco tus cuentas...")
+        ESTADO.tareas.append(asyncio.create_task(descubrir_cuentas()))
+        ESTADO.tareas.append(asyncio.create_task(keep_alive(RENDER_URL)))
+        return
     DERIV = DerivClient(DERIV_TOKEN, DERIV_URL)
     DERIV.iniciar()
     ESTADO.tareas.append(asyncio.create_task(cargar_multiplicadores()))
