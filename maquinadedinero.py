@@ -802,6 +802,47 @@ def verificar_modo() -> None:
         raise RuntimeError("El token no coincide con MODO_REAL. Con MODO_REAL=false solo se opera en demo.")
 
 
+def payload_propuesta(plan: Plan, simbolo: str) -> dict:
+    return {
+        "proposal": 1,
+        "amount": STAKE,
+        "basis": "stake",
+        "contract_type": "MULTUP" if plan.direccion > 0 else "MULTDOWN",
+        "currency": "USD",
+        CLAVE_SIMBOLO: simbolo,
+        "multiplier": plan.multiplicador,
+        "limit_order": {
+            "stop_loss": plan.riesgo_usd,
+            "take_profit": plan.beneficio_usd,
+        },
+    }
+
+
+def traducir_error_deriv(mensaje: str) -> str:
+    """Pasa a español los rechazos más comunes de Deriv y conserva el texto original."""
+    m = re.search(r"equal to or lower than ([0-9]+(?:\.[0-9]+)?)", mensaje)
+    if m:
+        return (
+            f"el stop loss no puede ser mayor a ${m.group(1)} (es el stake menos la comisión de Deriv). "
+            f"Escribe un stop menor o sube STAKE en Render. [Deriv: {mensaje}]"
+        )
+    m = re.search(r"equal to or higher than ([0-9]+(?:\.[0-9]+)?)", mensaje)
+    if m:
+        return f"ese monto no puede ser menor a ${m.group(1)}. [Deriv: {mensaje}]"
+    return mensaje
+
+
+async def validar_plan(plan: Plan) -> str:
+    """Pide una propuesta a Deriv (sin comprar) para comprobar los montos. Devuelve el error, o '' si está bien."""
+    try:
+        await DERIV.request(payload_propuesta(plan, ESTADO.simbolo))
+    except DerivError as exc:
+        return traducir_error_deriv(str(exc))
+    except Exception as exc:  # problemas de red: no bloqueamos, Deriv volverá a validar al comprar
+        log.warning("No pude validar la propuesta con Deriv: %s", exc)
+    return ""
+
+
 async def abrir_operacion(plan: Plan, bot, multiple: bool = False, avisar: bool = True) -> str:
     simbolo = ESTADO.simbolo
     if not simbolo_permitido(simbolo):
@@ -812,24 +853,7 @@ async def abrir_operacion(plan: Plan, bot, multiple: bool = False, avisar: bool 
             abiertos = await DERIV.request({"portfolio": 1})
             if abiertos["portfolio"].get("contracts"):
                 raise RuntimeError("ya hay una operacion abierta; espero a que cierre")
-        tipo = "MULTUP" if plan.direccion > 0 else "MULTDOWN"
-        propuesta = (
-            await DERIV.request(
-                {
-                    "proposal": 1,
-                    "amount": STAKE,
-                    "basis": "stake",
-                    "contract_type": tipo,
-                    "currency": "USD",
-                    CLAVE_SIMBOLO: simbolo,
-                    "multiplier": plan.multiplicador,
-                    "limit_order": {
-                        "stop_loss": plan.riesgo_usd,
-                        "take_profit": plan.beneficio_usd,
-                    },
-                }
-            )
-        )["proposal"]
+        propuesta = (await DERIV.request(payload_propuesta(plan, simbolo)))["proposal"]
         # En la API nueva ask_price puede llegar como texto.
         compra = (
             await DERIV.request({"buy": propuesta["id"], "price": float(propuesta["ask_price"])})
@@ -1135,7 +1159,7 @@ async def ejecutar_manual(query, bot) -> None:
         try:
             abiertos.append(await abrir_operacion(plan, bot, multiple=True, avisar=False))
         except Exception as exc:
-            error = str(exc)
+            error = traducir_error_deriv(str(exc))
             break
     texto = f"Abiertas {len(abiertos)} de {len(planes)} en {nombre_simbolo(ESTADO.simbolo)}."
     if abiertos:
@@ -1204,7 +1228,8 @@ async def on_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await editar(query, f"{ESTADO.manual_n} operación(es), {etiquetas[modo]}.")
             await query.message.reply_text(
                 "Escribe tu stop loss en dolares POR OPERACION, por ejemplo 0.40.\n"
-                "No acepto 0.10. Ese stop es el que cerraba todo en perdida."
+                f"Tiene que ser menor que tu stake (${STAKE:.2f}; con la comision de Deriv el maximo ronda ${max(STAKE - 0.03, 0.15):.2f}). "
+                "No acepto menos de 0.15."
             )
         elif dato == "ok":
             await ejecutar_manual(query, context.bot)
@@ -1237,6 +1262,13 @@ async def on_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if valor > 2:
             await update.message.reply_text("Para esta cuenta el stop maximo es 2.00.")
+            return
+        if valor >= STAKE:
+            await update.message.reply_text(
+                f"El stop no puede ser igual o mayor que tu stake (${STAKE:.2f}): perderias mas de lo que apuestas. "
+                f"Ademas Deriv descuenta una comision, asi que el maximo real queda un poco por debajo "
+                f"(con stake $1.00 ronda $0.97). Escribe un stop menor, o sube STAKE en Render."
+            )
             return
         ESTADO.manual_sl = valor
         ESTADO.manual_paso = "tp"
@@ -1274,6 +1306,12 @@ async def on_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"No entro: {motivo}\nEscribe otro stop.")
             return
         planes.append(plan)
+    error = await validar_plan(planes[0])
+    if error:
+        ESTADO.manual_paso = "sl"
+        ESTADO.manual_sl = 0.0
+        await update.message.reply_text(f"Deriv no acepta esos montos: {error}\n\nEscribe otro stop (despues te pido el take profit).")
+        return
     ESTADO.manual_planes = planes
     ESTADO.manual_paso = "confirmar"
     await update.message.reply_text(resumen_manual(planes), reply_markup=teclado_confirmar())
