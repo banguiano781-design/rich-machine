@@ -27,7 +27,7 @@ import requests
 import websockets
 from flask import Flask
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict, NetworkError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -95,6 +95,10 @@ MAX_OPERACIONES = max(1, min(10, int(os.environ.get("MAX_OPERACIONES", "5"))))
 
 # Hora local para decidir si es fin de semana (México = UTC-6; cámbialo con UTC_OFFSET_HORAS).
 ZONA_LOCAL = timezone(timedelta(hours=float(os.environ.get("UTC_OFFSET_HORAS", "-6"))))
+# El mercado de pares (forex y oro) cierra el viernes por la tarde y reabre el domingo por la tarde.
+# Horas locales aproximadas (16:00 hora de México ~ 22:00 UTC). Ajústalas en Render si hace falta.
+VIERNES_CIERRE_HORA = float(os.environ.get("VIERNES_CIERRE_HORA", "16"))
+DOMINGO_APERTURA_HORA = float(os.environ.get("DOMINGO_APERTURA_HORA", "16"))
 
 # Entre semana (lunes a viernes) solo estos pares. Código de Deriv -> nombre para mostrar.
 PARES_SEMANA = {
@@ -689,7 +693,23 @@ def texto_alerta(plan: Plan) -> str:
 
 
 def es_finde() -> bool:
-    return datetime.now(ZONA_LOCAL).weekday() >= 5
+    """True mientras el mercado de pares está cerrado: del viernes por la tarde al domingo por la tarde (hora local)."""
+    ahora = datetime.now(ZONA_LOCAL)
+    hora = ahora.hour + ahora.minute / 60
+    dia = ahora.weekday()  # 0 = lunes ... 6 = domingo
+    if dia == 4:
+        return hora >= VIERNES_CIERRE_HORA
+    if dia == 5:
+        return True
+    if dia == 6:
+        return hora < DOMINGO_APERTURA_HORA
+    return False
+
+
+def hora_local_texto() -> str:
+    dias = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
+    ahora = datetime.now(ZONA_LOCAL)
+    return f"{dias[ahora.weekday()]} {ahora.strftime('%H:%M')}"
 
 
 def catalogo_hoy() -> dict[str, str]:
@@ -706,7 +726,7 @@ def simbolo_permitido(codigo: str) -> bool:
 
 def descripcion_dia() -> str:
     if es_finde():
-        return "Fin de semana: solo índices sintéticos (modo prueba del bot)."
+        return "Fin de semana (mercado de pares cerrado): solo índices sintéticos, modo prueba del bot."
     return "Entre semana: solo pares (forex y oro)."
 
 
@@ -751,20 +771,28 @@ def estado_auto(texto: str) -> None:
 async def cambiar_simbolo(codigo: str) -> str:
     """Cambia el par activo. Devuelve un aviso si no se pudo, o '' si todo salió bien."""
     nombre = nombre_simbolo(codigo)
+    aviso = ""
     if not simbolo_permitido(codigo):
-        return f"{nombre} no está habilitado hoy. {descripcion_dia()}"
-    try:
-        lista, ok = await multiplicadores_del_simbolo(codigo)
-    except Exception as exc:
-        return f"No pude verificar {nombre}: {exc}"
-    if not ok:
-        return f"{nombre} no tiene multiplicadores disponibles ahora (mercado cerrado o no ofrecido). Elige otro."
+        aviso = f"{nombre} no está habilitado hoy. {descripcion_dia()}"
+    else:
+        try:
+            lista, ok = await multiplicadores_del_simbolo(codigo)
+        except Exception as exc:
+            lista, ok = [], False
+            aviso = f"No pude verificar {nombre}: {exc}"
+        else:
+            if not ok:
+                aviso = f"{nombre} no tiene multiplicadores disponibles ahora (mercado cerrado o no ofrecido). Elige otro."
+    if aviso:
+        log.warning("Cambio de par rechazado (%s): %s", codigo, aviso)
+        return aviso
     ESTADO.simbolo = codigo
     ESTADO.pip = None
     ESTADO.decimales = 5
     ESTADO.multiplicadores = lista
     ESTADO.ultima_vela = None
     cancelar_manual()
+    log.info("Par cambiado a %s (multiplicadores %s)", codigo, lista)
     return ""
 
 
@@ -960,6 +988,7 @@ def texto_menu() -> str:
     lineas = [
         f"Par: {nombre_simbolo(ESTADO.simbolo)} ({ESTADO.simbolo})",
         f"Cuenta: {cuenta}",
+        f"Hora del bot: {hora_local_texto()} (UTC{ZONA_LOCAL.utcoffset(None).total_seconds() / 3600:+.0f})",
         descripcion_dia(),
         f"Modo automático: {auto}",
     ]
@@ -1137,6 +1166,7 @@ async def on_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     dato = query.data or ""
+    log.info("Botón %s | par=%s | %s", dato, ESTADO.simbolo, descripcion_dia())
     try:
         if dato == "menu":
             cancelar_manual()
@@ -1302,6 +1332,20 @@ async def on_shutdown(app: Application) -> None:
         await DERIV.detener()
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    err = context.error
+    if isinstance(err, Conflict):
+        log.warning(
+            "Telegram: hay OTRA copia del bot usando este mismo token (Conflict). "
+            "Es normal unos segundos al desplegar; si se repite, apaga la otra copia o cambia el token en BotFather."
+        )
+        return
+    if isinstance(err, NetworkError):
+        log.warning("Telegram: error de red temporal: %s", err)
+        return
+    log.error("Error no controlado en Telegram", exc_info=err)
+
+
 def main() -> None:
     iniciar_servidor_web()
     app = (
@@ -1311,6 +1355,7 @@ def main() -> None:
         .post_shutdown(on_shutdown)
         .build()
     )
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ganancias", cmd_ganancias))
     app.add_handler(CallbackQueryHandler(on_boton))
