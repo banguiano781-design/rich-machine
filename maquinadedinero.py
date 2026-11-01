@@ -1250,25 +1250,27 @@ async def on_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_texto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ESTADO.manual_paso not in ("sl", "tp"):
         return
-    bruto = (update.message.text or "").replace(",", ".").replace("$", "").strip()
-    try:
-        valor = round(float(bruto), 2)
-    except ValueError:
+    coincidencia = re.search(r"\d+(?:[.,]\d+)?", update.message.text or "")
+    if not coincidencia:
         await update.message.reply_text("Escribe solo el numero en dolares. Ejemplo: 0.40")
         return
+    valor = round(float(coincidencia.group(0).replace(",", ".")), 2)
     if ESTADO.manual_paso == "sl":
         if valor < 0.15:
             await update.message.reply_text("Ese stop queda dentro del ruido. Minimo 0.15. En automatico uso 0.40.")
             return
+        if valor >= STAKE:
+            ejemplo_sl = round(max(0.15, STAKE * 0.5), 2)
+            ejemplo_tp = round(ejemplo_sl * RATIO_RR, 2)
+            await update.message.reply_text(
+                f"Con tu stake actual (${STAKE:.2f}) no se puede perder mas de ${STAKE:.2f} por operacion, "
+                f"y con la comision de Deriv el maximo real queda un poco menos.\n\n"
+                f"Prueba con un stop menor, por ejemplo {ejemplo_sl:.2f} (y take profit {ejemplo_tp:.2f}).\n"
+                f"Si quieres arriesgar mas por operacion, sube la variable STAKE en Render (primero en demo)."
+            )
+            return
         if valor > 2:
             await update.message.reply_text("Para esta cuenta el stop maximo es 2.00.")
-            return
-        if valor >= STAKE:
-            await update.message.reply_text(
-                f"El stop no puede ser igual o mayor que tu stake (${STAKE:.2f}): perderias mas de lo que apuestas. "
-                f"Ademas Deriv descuenta una comision, asi que el maximo real queda un poco por debajo "
-                f"(con stake $1.00 ronda $0.97). Escribe un stop menor, o sube STAKE en Render."
-            )
             return
         ESTADO.manual_sl = valor
         ESTADO.manual_paso = "tp"
