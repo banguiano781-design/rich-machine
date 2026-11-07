@@ -81,14 +81,28 @@ ZLEN = 20
 ATR_LEN = 14
 EMA_MACRO = 200
 VOL_LEN = 20
-VOL_MULT = 2.5
-Z_UMBRAL = 2.5
+VOL_MULT = float(os.environ.get("VOL_MULT", "2.5"))   # veces el promedio de volumen para considerarlo "institucional"
+Z_UMBRAL = float(os.environ.get("Z_UMBRAL", "2.5"))   # Z-Score mínimo (en valor absoluto) para dar señal
 
 GRANULARIDAD = 60
 VELAS = 300
-TICKS = 5000
-INTERVALO_KEEPALIVE = 600
+TICKS = int(os.environ.get("TICKS", "2000"))
+INTERVALO_KEEPALIVE = int(os.environ.get("KEEPALIVE_SEGUNDOS", "300"))   # Render duerme el servicio a los 15 min sin tráfico
 INTERVALO_AUTO = 20
+LATIDO_MINUTOS = int(os.environ.get("LATIDO_MINUTOS", "60"))   # resumen silencioso por Telegram con el auto activo (0 = apagado)
+AUTO_AL_ARRANCAR = os.environ.get("AUTO_AL_ARRANCAR", "false").strip().lower() == "true"
+
+# Salida anticipada por agotamiento de tendencia (solo se vende si la operación va ganando).
+# Se vende cuando se cumplen TODAS estas condiciones al cerrar una vela de 1 minuto:
+#   1) la ganancia actual es al menos AGOTA_MIN_PROFIT_R veces lo arriesgado,
+#   2) el Z-Score cayó AGOTA_CAIDA_Z puntos desde su máximo a favor desde la entrada,
+#   3) hubo AGOTA_VELAS cierres seguidos en contra,
+#   4) el precio retrocedió AGOTA_RETROCESO_ATR veces el ATR desde su pico a favor.
+SALIDA_TEMPRANA_INICIAL = os.environ.get("SALIDA_TEMPRANA", "true").strip().lower() == "true"
+MIN_PROFIT_R = float(os.environ.get("AGOTA_MIN_PROFIT_R", "0.5"))
+CAIDA_Z = float(os.environ.get("AGOTA_CAIDA_Z", "1.0"))
+VELAS_CONFIRMA = int(os.environ.get("AGOTA_VELAS", "2"))
+RETROCESO_ATR = float(os.environ.get("AGOTA_RETROCESO_ATR", "1.0"))
 MIN_VELAS_MANUAL = 60      # en modo manual basta con menos velas que en automático
 MAX_PAGINAS_TICKS = 6      # veces que se pide más historial de ticks si la API limita la cantidad
 MAX_OPERACIONES = max(1, min(10, int(os.environ.get("MAX_OPERACIONES", "5"))))
@@ -179,8 +193,10 @@ async def keep_alive(url: str) -> None:
         await asyncio.sleep(INTERVALO_KEEPALIVE)
         try:
             resp = await asyncio.to_thread(requests.get, url, timeout=20)
+            ESTADO.ultimo_keepalive = f"{hora_local_texto()} -> HTTP {resp.status_code}"
             log.info("Keep-alive %s -> %s", url, resp.status_code)
         except Exception as exc:
+            ESTADO.ultimo_keepalive = f"{hora_local_texto()} -> FALLÓ ({exc})"
             log.warning("Keep-alive falló: %s", exc)
 
 
@@ -427,6 +443,7 @@ class Lectura:
     ema_macro: float
     vol_inst: bool
     nota: str = ""
+    vol_ratio: float = 0.0
 
 
 def proxy_volumen(precios: list, tiempos: list) -> pd.Series:
@@ -456,6 +473,7 @@ def calcular_indicadores(velas: pd.DataFrame) -> pd.DataFrame:
     df["ema_macro"] = cierre.ewm(span=EMA_MACRO, adjust=False).mean()
     df["vol_media"] = df["vol_proxy"].rolling(VOL_LEN).mean()
     df["vol_inst"] = df["vol_proxy"] > df["vol_media"] * VOL_MULT
+    df["vol_ratio"] = df["vol_proxy"] / df["vol_media"].replace(0, np.nan)
     return df
 
 
@@ -578,6 +596,7 @@ async def leer_mercado(estricto: bool = True) -> Lectura | None:
         ema_macro=float(cerrada["ema_macro"]),
         vol_inst=bool(cerrada["vol_inst"]) if cobertura else False,
         nota=nota,
+        vol_ratio=(float(cerrada["vol_ratio"]) if cobertura and not pd.isna(cerrada["vol_ratio"]) else 0.0),
     )
 
 
@@ -735,9 +754,27 @@ def simbolo_inicial() -> str:
     return SYMBOL if SYMBOL in hoy else next(iter(hoy))
 
 
+@dataclass
+class Seguimiento:
+    """Datos de una operación abierta para decidir si la tendencia se agotó."""
+    contrato: str
+    direccion: int
+    simbolo: str
+    riesgo: float
+    entrada_vela: int
+    ultima_evaluada: int | None = None
+    zd_max: float = 0.0
+    pico: float | None = None
+    cierre_prev: float = 0.0
+    adversas: int = 0
+    profit: float | None = None
+    valido: bool = True
+    motivo: str = ""
+
+
 class Estado:
     def __init__(self) -> None:
-        self.auto_activo = False
+        self.auto_activo = AUTO_AL_ARRANCAR
         self.ultima_vela: int | None = None
         self.pausa_hasta = 0.0
         self.multiplicadores: list[int] = list(MULTIPLICADORES)
@@ -755,6 +792,19 @@ class Estado:
         self.manual_modo = ""
         self.manual_sl = 0.0
         self.manual_planes: list[Plan] = []
+        self.inicio_ts = time.time()
+        self.ultimo_keepalive = "todavía ninguno"
+        self.ultima_lectura: Lectura | None = None
+        self.proximo_intento = 0.0
+        self.velas_vistas = 0
+        self.senales = 0
+        self.descartadas = 0
+        self.abiertas_auto = 0
+        self.datos_insuficientes = 0
+        self.errores_ciclo = 0
+        self.salida_temprana = SALIDA_TEMPRANA_INICIAL
+        self.contratos: dict[str, Seguimiento] = {}
+        self.salidas_anticipadas = 0
 
 
 ESTADO = Estado()
@@ -859,6 +909,13 @@ async def abrir_operacion(plan: Plan, bot, multiple: bool = False, avisar: bool 
             await DERIV.request({"buy": propuesta["id"], "price": float(propuesta["ask_price"])})
         )["buy"]
         contrato = str(compra["contract_id"])
+    ESTADO.contratos[contrato] = Seguimiento(
+        contrato=contrato,
+        direccion=plan.direccion,
+        simbolo=simbolo,
+        riesgo=plan.riesgo_usd,
+        entrada_vela=int(time.time()) // GRANULARIDAD * GRANULARIDAD,
+    )
     if avisar:
         await bot.send_message(chat_id=CHAT_ID, text=texto_alerta(plan))
     tarea = asyncio.create_task(vigilar_contrato(contrato, bot))
@@ -871,23 +928,142 @@ async def vigilar_contrato(contrato: str, bot) -> None:
     while True:
         await asyncio.sleep(5)
         try:
-            respuesta = await DERIV.request({"proposal_open_contract": 1, "contract_id": int(contrato) if contrato.isdigit() else contrato})
+            respuesta = await DERIV.request(
+                {"proposal_open_contract": 1, "contract_id": int(contrato) if contrato.isdigit() else contrato}
+            )
         except Exception as exc:
             log.warning("No pude consultar el contrato %s: %s", contrato, exc)
             continue
         contrato_abierto = respuesta["proposal_open_contract"]
+        seg = ESTADO.contratos.get(contrato)
+        if seg is not None:
+            try:
+                seg.profit = float(contrato_abierto.get("profit") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            seg.valido = bool(contrato_abierto.get("is_valid_to_sell", 1))
         if contrato_abierto.get("is_sold"):
-            resultado = float(contrato_abierto.get("profit", 0.0))
+            resultado = float(contrato_abierto.get("profit") or 0.0)
             if resultado < 0:
                 ESTADO.pausa_hasta = time.time() + PAUSA_TRAS_STOP
+            motivo = ESTADO.contratos.pop(contrato, None)
+            extra = " por agotamiento de la tendencia" if (motivo is not None and motivo.motivo == "agotamiento") else ""
             try:
                 await bot.send_message(
                     chat_id=CHAT_ID,
-                    text=f"Contrato {contrato} cerrado. Resultado: ${resultado:+.2f}",
+                    text=f"Contrato {contrato} cerrado{extra}. Resultado: ${resultado:+.2f}",
                 )
             except Exception as exc:
                 log.warning("No pude notificar el cierre: %s", exc)
             return
+
+
+async def velas_cerradas(simbolo: str) -> pd.DataFrame | None:
+    """Velas de 1 minuto ya cerradas, con Z-Score y ATR (solo velas, sin ticks: es una consulta ligera)."""
+    r = await DERIV.request(
+        {"ticks_history": simbolo, "style": "candles", "granularity": GRANULARIDAD, "count": 90, "end": "latest"}
+    )
+    velas = pd.DataFrame(r.get("candles") or [])
+    if len(velas) < ZLEN + 5:
+        return None
+    for col in ("open", "high", "low", "close"):
+        velas[col] = pd.to_numeric(velas[col]).astype(float)
+    velas["epoch"] = pd.to_numeric(velas["epoch"]).astype("int64")
+    velas["vol_proxy"] = 0.0
+    ind = calcular_indicadores(velas)
+    return ind.iloc[:-1].reset_index(drop=True)  # se descarta la vela en curso
+
+
+def agotamiento_confirmado(seg: Seguimiento, fila) -> tuple[bool, str]:
+    """Evalúa las 4 condiciones sobre la última vela cerrada. Devuelve (se cumple, detalle)."""
+    d = seg.direccion
+    z = float(fila.z) if not pd.isna(fila.z) else None
+    atr = float(fila.atr) if not pd.isna(fila.atr) else None
+    if z is None or atr is None or seg.pico is None:
+        return False, "sin datos"
+    retroceso = (seg.pico - float(fila.close)) if d > 0 else (float(fila.close) - seg.pico)
+    c_profit = seg.profit is not None and seg.profit >= MIN_PROFIT_R * seg.riesgo
+    c_momento = d * z <= seg.zd_max - CAIDA_Z
+    c_estructura = seg.adversas >= VELAS_CONFIRMA
+    c_retroceso = retroceso >= RETROCESO_ATR * atr
+    detalle = (
+        f"ganancia {'$%.2f' % seg.profit if seg.profit is not None else '?'} "
+        f"(pide ${MIN_PROFIT_R * seg.riesgo:.2f}): {'SI' if c_profit else 'no'} | "
+        f"Z cayo {seg.zd_max - d * z:.1f} (pide {CAIDA_Z:g}): {'SI' if c_momento else 'no'} | "
+        f"cierres en contra {seg.adversas} (pide {VELAS_CONFIRMA}): {'SI' if c_estructura else 'no'} | "
+        f"retroceso {retroceso / atr:.1f} ATR (pide {RETROCESO_ATR:g}): {'SI' if c_retroceso else 'no'}"
+    )
+    return (c_profit and c_momento and c_estructura and c_retroceso), detalle
+
+
+async def evaluar_agotamiento(seg: Seguimiento, ind: pd.DataFrame) -> None:
+    """Actualiza el seguimiento con las velas nuevas y vende si la tendencia se agotó y hay ganancia."""
+    nuevas = ind[ind["epoch"] >= seg.entrada_vela]
+    if seg.ultima_evaluada is not None:
+        nuevas = nuevas[nuevas["epoch"] > seg.ultima_evaluada]
+    if nuevas.empty:
+        return
+    d = seg.direccion
+    ultima = None
+    for fila in nuevas.itertuples():
+        zd = d * float(fila.z) if not pd.isna(fila.z) else None
+        if seg.pico is None:  # vela de entrada: punto de partida
+            seg.zd_max = zd if zd is not None else 0.0
+            seg.pico = float(fila.high) if d > 0 else float(fila.low)
+            seg.adversas = 0
+        else:
+            if zd is not None:
+                seg.zd_max = max(seg.zd_max, zd)
+            seg.pico = max(seg.pico, float(fila.high)) if d > 0 else min(seg.pico, float(fila.low))
+            adversa = float(fila.close) < seg.cierre_prev if d > 0 else float(fila.close) > seg.cierre_prev
+            seg.adversas = seg.adversas + 1 if adversa else 0
+        seg.cierre_prev = float(fila.close)
+        seg.ultima_evaluada = int(fila.epoch)
+        ultima = fila
+    if ultima is None or not ESTADO.salida_temprana:
+        return
+    cumple, detalle = agotamiento_confirmado(seg, ultima)
+    if not cumple:
+        log.info("Contrato %s sigue abierto: %s", seg.contrato, detalle)
+        return
+    if not seg.valido:
+        log.info("Contrato %s: agotamiento confirmado pero Deriv indica que aun no se puede vender", seg.contrato)
+        return
+    try:
+        seg.motivo = "agotamiento"
+        resp = await DERIV.request({"sell": int(seg.contrato), "price": 0})
+        ESTADO.salidas_anticipadas += 1
+        log.info("Salida anticipada del contrato %s por agotamiento: %s | vendido por %s",
+                 seg.contrato, detalle, resp.get("sell", {}).get("sold_for"))
+    except Exception as exc:
+        seg.motivo = ""
+        log.warning("No pude vender el contrato %s por agotamiento: %s", seg.contrato, exc)
+
+
+async def ciclo_salidas() -> None:
+    ahora = int(time.time())
+    ultima_cerrada = ahora // GRANULARIDAD * GRANULARIDAD - GRANULARIDAD
+    por_simbolo: dict[str, list[Seguimiento]] = {}
+    for seg in list(ESTADO.contratos.values()):
+        if seg.ultima_evaluada is not None and seg.ultima_evaluada >= ultima_cerrada:
+            continue  # ya se evaluó la última vela cerrada
+        por_simbolo.setdefault(seg.simbolo, []).append(seg)
+    for simbolo, segs in por_simbolo.items():
+        ind = await velas_cerradas(simbolo)
+        if ind is None:
+            continue
+        for seg in segs:
+            await evaluar_agotamiento(seg, ind)
+
+
+async def bucle_salidas() -> None:
+    while True:
+        await asyncio.sleep(10)
+        if ESTADO.salida_temprana and ESTADO.contratos:
+            try:
+                await ciclo_salidas()
+            except Exception as exc:
+                log.warning("Error revisando salidas anticipadas: %s", exc)
 
 
 async def resumen_resultados(desde: int | None) -> tuple[int, float]:
@@ -914,30 +1090,56 @@ async def texto_ganancias() -> str:
     )
 
 
+def explicar_sin_senal(lectura: Lectura) -> str:
+    alcista = lectura.cierre > lectura.ema_macro
+    cond_z = abs(lectura.z) >= Z_UMBRAL
+    a_favor = (lectura.z >= Z_UMBRAL and alcista) or (lectura.z <= -Z_UMBRAL and not alcista)
+    marca = lambda ok: "SI" if ok else "no"  # noqa: E731
+    return (
+        f"sin señal | z={lectura.z:+.2f} (pide ±{Z_UMBRAL:g}): {marca(cond_z)} | "
+        f"volumen x{lectura.vol_ratio:.1f} (pide x{VOL_MULT:g}): {marca(lectura.vol_inst)} | "
+        f"tendencia {'alcista' if alcista else 'bajista'} y a favor del pico: {marca(a_favor)}"
+    )
+
+
 async def ciclo_automatico(bot) -> None:
     if not simbolo_permitido(ESTADO.simbolo):
         estado_auto("el par actual no está habilitado hoy; elige otro en 'Cambiar par'")
         return
+    ahora = time.time()
+    if ahora < ESTADO.proximo_intento:
+        return
+    # Solo hay algo nuevo que analizar cuando se cierra una vela de 1 minuto: no se descarga historial de más.
+    ultima_cerrada = int(ahora) // GRANULARIDAD * GRANULARIDAD - GRANULARIDAD
+    if ESTADO.ultima_vela is not None and ESTADO.ultima_vela >= ultima_cerrada:
+        return
     lectura = await leer_mercado(estricto=True)
     if lectura is None:
+        ESTADO.datos_insuficientes += 1
+        ESTADO.proximo_intento = time.time() + 60
         estado_auto(f"sin datos suficientes: {ESTADO.motivo_datos}")
         return
+    ESTADO.ultima_lectura = lectura
     if lectura.epoch == ESTADO.ultima_vela:
         return
     ESTADO.ultima_vela = lectura.epoch
+    ESTADO.velas_vistas += 1
     if time.time() < ESTADO.pausa_hasta:
         estado_auto("en pausa tras un stop")
         return
     direccion = direccion_senal(lectura)
     if direccion is None:
-        estado_auto(f"sin señal (z={lectura.z:+.2f}, volumen {'alto' if lectura.vol_inst else 'normal'})")
+        estado_auto(explicar_sin_senal(lectura))
         return
+    ESTADO.senales += 1
     plan, motivo = planificar(direccion, lectura.precio_vivo, lectura.atr_stop, ESTADO.multiplicadores)
     if plan is None:
+        ESTADO.descartadas += 1
         estado_auto(f"señal descartada: {motivo}")
         return
     try:
         await abrir_operacion(plan, bot)
+        ESTADO.abiertas_auto += 1
         estado_auto("operación abierta")
     except Exception as exc:
         estado_auto(f"orden no enviada: {exc}")
@@ -948,9 +1150,34 @@ async def bucle_automatico(bot) -> None:
         if ESTADO.auto_activo:
             try:
                 await ciclo_automatico(bot)
-            except Exception:
+            except Exception as exc:
+                ESTADO.errores_ciclo += 1
+                estado_auto(f"error en el ciclo: {exc}")
                 log.exception("Error en el ciclo automático")
         await asyncio.sleep(INTERVALO_AUTO)
+
+
+async def latido(bot) -> None:
+    """Resumen silencioso cada LATIDO_MINUTOS mientras el modo automático está activo."""
+    previo = (0, 0, 0, 0)
+    while True:
+        await asyncio.sleep(LATIDO_MINUTOS * 60)
+        actual = (ESTADO.velas_vistas, ESTADO.senales, ESTADO.abiertas_auto, ESTADO.descartadas)
+        if ESTADO.auto_activo:
+            dv, ds, da, dd = (a - b for a, b in zip(actual, previo))
+            try:
+                await bot.send_message(
+                    chat_id=CHAT_ID,
+                    disable_notification=True,
+                    text=(
+                        f"Auto activo en {nombre_simbolo(ESTADO.simbolo)}. Ultimos {LATIDO_MINUTOS} min: "
+                        f"{dv} velas analizadas, {ds} señales, {da} operaciones abiertas, {dd} descartadas.\n"
+                        f"Ultimo analisis: {ESTADO.ultimo_estado or 'ninguno todavia'}"
+                    ),
+                )
+            except Exception as exc:
+                log.warning("No pude enviar el resumen periodico: %s", exc)
+        previo = actual
 
 
 def solo_dueno(func):
@@ -1003,6 +1230,35 @@ def direccion_senal(lectura: Lectura) -> int | None:
     return None
 
 
+def texto_estado() -> str:
+    seg = int(time.time() - ESTADO.inicio_ts)
+    conectado = "si" if (DERIV is not None and DERIV.listo.is_set()) else "NO"
+    pausa = max(0, int(ESTADO.pausa_hasta - time.time()))
+    lectura = ESTADO.ultima_lectura
+    lineas = [
+        f"Hora del bot: {hora_local_texto()} | encendido hace {seg // 3600} h {(seg % 3600) // 60} min",
+        f"Par: {nombre_simbolo(ESTADO.simbolo)} | Deriv conectado: {conectado}",
+        f"Modo automatico: {'ACTIVO' if ESTADO.auto_activo else 'apagado'}",
+        f"Ultimo analisis: {ESTADO.ultimo_estado or 'todavia ninguno'}",
+        f"Velas analizadas: {ESTADO.velas_vistas} | señales: {ESTADO.senales} | abiertas: {ESTADO.abiertas_auto} | descartadas: {ESTADO.descartadas}",
+        f"Sin datos suficientes: {ESTADO.datos_insuficientes} veces | errores del ciclo: {ESTADO.errores_ciclo}",
+        f"Pausa tras stop: {'si, quedan ' + str(pausa // 60 + 1) + ' min' if pausa else 'no'}",
+        f"Umbrales: z ±{Z_UMBRAL:g} y volumen x{VOL_MULT:g} sobre el promedio",
+        f"Salida anticipada: {'ACTIVA' if ESTADO.salida_temprana else 'apagada'} | "
+        f"operaciones en seguimiento: {len(ESTADO.contratos)} | ventas por agotamiento: {ESTADO.salidas_anticipadas}",
+        f"Keep-alive de Render: {ESTADO.ultimo_keepalive}",
+    ]
+    if lectura is not None:
+        lineas.insert(4, f"Ultima lectura: z={lectura.z:+.2f} | volumen x{lectura.vol_ratio:.1f} | "
+                         f"tendencia {'alcista' if lectura.cierre > lectura.ema_macro else 'bajista'}")
+    if ESTADO.simbolo in INDICES_FINDE:
+        lineas.append(
+            "Aviso: en los indices sinteticos el volumen casi no varia, asi que el filtro de volumen casi nunca "
+            "se cumple. Para probar el bot baja VOL_MULT (por ejemplo 1.2) en Render."
+        )
+    return "\n".join(lineas)
+
+
 def texto_menu() -> str:
     cuenta = "sin conexión"
     if DERIV is not None and DERIV.info:
@@ -1015,6 +1271,7 @@ def texto_menu() -> str:
         f"Hora del bot: {hora_local_texto()} (UTC{ZONA_LOCAL.utcoffset(None).total_seconds() / 3600:+.0f})",
         descripcion_dia(),
         f"Modo automático: {auto}",
+        f"Salida anticipada por agotamiento: {'ACTIVA (solo con ganancia)' if ESTADO.salida_temprana else 'apagada'}",
     ]
     if ESTADO.auto_activo and ESTADO.ultimo_estado:
         lineas.append(f"Último análisis: {ESTADO.ultimo_estado}")
@@ -1035,7 +1292,13 @@ def teclado_menu() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Modo Manual", callback_data="manual")],
             [boton_auto],
             [InlineKeyboardButton("Cambiar par", callback_data="pares")],
-            [InlineKeyboardButton("Ganancias", callback_data="ganancias")],
+            [
+                InlineKeyboardButton(
+                    "Salida anticipada: " + ("ON" if ESTADO.salida_temprana else "OFF"),
+                    callback_data="salida:off" if ESTADO.salida_temprana else "salida:on",
+                )
+            ],
+            [InlineKeyboardButton("Ganancias", callback_data="ganancias"), InlineKeyboardButton("Estado", callback_data="estado")],
         ]
     )
 
@@ -1176,6 +1439,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @solo_dueno
+async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(texto_estado())
+
+
+@solo_dueno
 async def cmd_ganancias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         texto = await texto_ganancias()
@@ -1239,8 +1507,13 @@ async def on_boton(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif dato == "auto:off":
             ESTADO.auto_activo = False
             await editar(query, texto_menu(), teclado_menu())
+        elif dato in ("salida:on", "salida:off"):
+            ESTADO.salida_temprana = dato == "salida:on"
+            await editar(query, texto_menu(), teclado_menu())
         elif dato == "ganancias":
             await editar(query, await texto_ganancias(), boton_volver())
+        elif dato == "estado":
+            await editar(query, texto_estado(), boton_volver())
     except Exception as exc:
         log.exception("Error en el botón %s", dato)
         await editar(query, f"Error: {exc}", boton_volver())
@@ -1363,6 +1636,21 @@ async def on_init(app: Application) -> None:
         RENDER_URL,
     )
     log.info("Par inicial: %s. %s", ESTADO.simbolo, descripcion_dia())
+    ESTADO.tareas.append(asyncio.create_task(bucle_salidas()))
+    if LATIDO_MINUTOS > 0:
+        ESTADO.tareas.append(asyncio.create_task(latido(app.bot)))
+    try:
+        await app.bot.send_message(
+            chat_id=CHAT_ID,
+            text=(
+                f"Bot iniciado ({hora_local_texto()}). Modo automatico: {'ACTIVO' if ESTADO.auto_activo else 'apagado'}. "
+                f"Par: {nombre_simbolo(ESTADO.simbolo)}.\n"
+                "Si ves este mensaje sin haber desplegado tu, Render reinicio el servicio "
+                "(en el plan gratis puede hacerlo en cualquier momento)."
+            ),
+        )
+    except Exception as exc:
+        log.warning("No pude avisar del inicio por Telegram: %s", exc)
 
 
 async def on_shutdown(app: Application) -> None:
@@ -1398,6 +1686,7 @@ def main() -> None:
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ganancias", cmd_ganancias))
+    app.add_handler(CommandHandler("estado", cmd_estado))
     app.add_handler(CallbackQueryHandler(on_boton))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_texto))
     app.run_polling(drop_pending_updates=True)
